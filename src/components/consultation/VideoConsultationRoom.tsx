@@ -240,6 +240,46 @@ const MeetingRoom: React.FC<{
     if (data) setMessages(data as ChatMessage[]);
   };
 
+  // Load messages when joined
+  useEffect(() => {
+    if (joined) {
+      fetchMessages().catch(() => {});
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [joined]);
+
+  // Send chat message handler (used by the chat form)
+  const handleSendMessage = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!inputMessage || !inputMessage.trim()) return;
+
+    const payload = {
+      room_id: roomId,
+      sender_id: currentUserId,
+      sender_name: currentUserName,
+      sender_role: currentUserRole,
+      text: inputMessage.trim(),
+    } as any;
+
+    try {
+      const { data, error } = await supabase
+        .from('consultation_messages')
+        .insert(payload)
+        .select()
+        .single();
+
+      if (error) throw error;
+
+      if (data) {
+        setMessages(prev => [...prev, data as ChatMessage]);
+        setInputMessage('');
+        setTimeout(() => chatEndRef.current?.scrollIntoView({ behavior: 'smooth' }), 50);
+      }
+    } catch (err) {
+      console.error('Send message failed', err);
+    }
+  };
+
   const handleSubmitForm = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!formSumAssured) return;
