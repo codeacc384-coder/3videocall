@@ -142,7 +142,16 @@ class RemoteControlServer {
     const parsedUrl = url.parse(req.url || '', true);
     const pathname = parsedUrl.pathname;
 
-    if (pathname === '/health') {
+    if (pathname === '/') {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(
+        JSON.stringify({
+          status: 'ok',
+          service: 'InsuranceOne Remote Control Relay',
+          websocket: '/remote-control',
+        })
+      );
+    } else if (pathname === '/health') {
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(
         JSON.stringify({
