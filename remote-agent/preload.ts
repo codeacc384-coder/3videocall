@@ -9,4 +9,5 @@ contextBridge.exposeInMainWorld('agentAPI', {
   onConnectionStatusChange: (callback: (status: any) => void) => {
     ipcRenderer.on('agent-connection-status', (event, data) => callback(data));
   },
+  registerWithRelay: (data: any) => ipcRenderer.invoke('register-with-relay', data),
 });

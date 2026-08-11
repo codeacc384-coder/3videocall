@@ -135,6 +135,11 @@ function initializeAgent() {
     }
   });
 
+  agentConnection.on('AGENT_REGISTERED', (event: RemoteControlEvent) => {
+    console.log('[Agent] AGENT_REGISTERED', event);
+    if (mainWindow) mainWindow.webContents.send('agent-registered', event);
+  });
+
   agentConnection.onConnectionChange((connected: boolean) => {
     console.log('[Agent] Relay connection status:', connected);
     if (mainWindow) {

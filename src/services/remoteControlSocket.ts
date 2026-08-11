@@ -4,9 +4,13 @@ import { RemoteControlEvent } from '../types/remoteControl';
  * Browser WebSocket client for Officer/Adviser to connect to relay server.
  * Remote-control traffic flows: Officer Browser → Render Relay → Customer Agent.
  * NOT for local agent detection (that uses http://127.0.0.1:9876/health only).
+ * 
+ * Singleton pattern to prevent duplicate connections on React re-renders.
  */
 
 export type RelayConnectionState = 'disconnected' | 'connecting' | 'connected' | 'error';
+
+let socketInstance: RemoteControlSocket | null = null;
 
 export class RemoteControlSocket {
   private ws: WebSocket | null = null;
@@ -14,12 +18,14 @@ export class RemoteControlSocket {
   private reconnectAttempts = 0;
   private maxReconnectAttempts = 5;
   private reconnectDelay = 1000;
-  private messageHandlers: Map<string, (event: RemoteControlEvent) => void> = new Map();
+  private messageHandlers: Map<string, Set<(event: RemoteControlEvent) => void>> = new Map();
   private connectionHandlers: ((connected: boolean) => void)[] = [];
   private stateHandlers: ((state: RelayConnectionState) => void)[] = [];
+  private manualDisconnect = false;
   private _state: RelayConnectionState = 'disconnected';
+  private isConnecting = false;
 
-  constructor(url?: string) {
+  private constructor(url?: string) {
     const envUrl = import.meta.env.VITE_REMOTE_CONTROL_WS_URL as string | undefined;
     this.relayUrl = url || envUrl || '';
 
@@ -33,24 +39,51 @@ export class RemoteControlSocket {
     console.log('[RemoteControl] Relay URL configured:', this.relayUrl);
   }
 
+  static getInstance(url?: string): RemoteControlSocket {
+    if (!socketInstance) {
+      socketInstance = new RemoteControlSocket(url);
+    }
+    return socketInstance;
+  }
+
+  static resetInstance(): void {
+    if (socketInstance) {
+      socketInstance.disconnect();
+      socketInstance = null;
+    }
+  }
+
   get connectionState(): RelayConnectionState {
     return this._state;
   }
 
   private setState(state: RelayConnectionState): void {
+    if (this._state === state) return;
     this._state = state;
     this.stateHandlers.forEach(h => h(state));
   }
 
   connect(): Promise<void> {
     return new Promise((resolve, reject) => {
+      if (this.isConnecting) {
+        reject(new Error('[RemoteControl] Connection already in progress'));
+        return;
+      }
+
+      if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+        resolve();
+        return;
+      }
+
       try {
+        this.isConnecting = true;
         console.log('[RemoteControl] Connecting to relay');
         this.setState('connecting');
         this.ws = new WebSocket(this.relayUrl);
 
         this.ws.onopen = () => {
           console.log('[RemoteControl] Relay connected');
+          this.isConnecting = false;
           this.reconnectAttempts = 0;
           this.setState('connected');
           this.notifyConnectionHandlers(true);
@@ -60,8 +93,10 @@ export class RemoteControlSocket {
         this.ws.onmessage = (event) => {
           try {
             const data = JSON.parse(event.data as string) as RemoteControlEvent;
-            const handler = this.messageHandlers.get(data.type);
-            if (handler) handler(data);
+            const handlers = this.messageHandlers.get(data.type);
+            if (handlers) {
+              handlers.forEach(h => h(data));
+            }
           } catch (err) {
             console.error('[RemoteControl] Failed to parse message:', err);
           }
@@ -69,17 +104,20 @@ export class RemoteControlSocket {
 
         this.ws.onerror = () => {
           console.error('[RemoteControl] WebSocket error');
+          this.isConnecting = false;
           this.setState('error');
           reject(new Error('[RemoteControl] WebSocket error'));
         };
 
         this.ws.onclose = () => {
           console.log('[RemoteControl] Relay disconnected');
+          this.isConnecting = false;
           this.setState('disconnected');
           this.notifyConnectionHandlers(false);
-          this.attemptReconnect();
+          if (!this.manualDisconnect) this.attemptReconnect();
         };
       } catch (err) {
+        this.isConnecting = false;
         this.setState('error');
         reject(err);
       }
@@ -97,7 +135,7 @@ export class RemoteControlSocket {
     }
   }
 
-  send(event: RemoteControlEvent): void {
+  send(event: RemoteControlEvent | any): void {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
       console.warn('[RemoteControl] Relay is not connected, dropping event:', event.type);
       return;
@@ -106,11 +144,24 @@ export class RemoteControlSocket {
   }
 
   on(eventType: string, handler: (event: RemoteControlEvent) => void): void {
-    this.messageHandlers.set(eventType, handler);
+    let set = this.messageHandlers.get(eventType);
+    if (!set) {
+      set = new Set();
+      this.messageHandlers.set(eventType, set);
+    }
+    set.add(handler);
   }
 
-  off(eventType: string): void {
-    this.messageHandlers.delete(eventType);
+  off(eventType: string, handler?: (event: RemoteControlEvent) => void): void {
+    if (!handler) {
+      this.messageHandlers.delete(eventType);
+      return;
+    }
+    const set = this.messageHandlers.get(eventType);
+    if (set) {
+      set.delete(handler);
+      if (set.size === 0) this.messageHandlers.delete(eventType);
+    }
   }
 
   onConnectionChange(handler: (connected: boolean) => void): void {
@@ -130,6 +181,7 @@ export class RemoteControlSocket {
   }
 
   disconnect(): void {
+    this.manualDisconnect = true;
     if (this.ws) {
       this.ws.close();
       this.ws = null;
