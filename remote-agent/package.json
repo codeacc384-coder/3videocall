@@ -1,0 +1,42 @@
+{
+  "name": "insuranceone-remote-agent",
+  "version": "1.0.0",
+  "description": "Remote Assistance Agent for InsuranceOne Video Consultation",
+  "main": "dist/main.js",
+  "author": "InsuranceOne",
+  "license": "MIT",
+  "scripts": {
+    "dev": "electron .",
+    "build": "tsc && electron-builder",
+    "pack": "electron-builder --dir",
+    "dist": "electron-builder"
+  },
+  "dependencies": {
+    "robotjs": "^0.6.0",
+    "ws": "^8.14.2"
+  },
+  "devDependencies": {
+    "electron": "^27.0.0",
+    "electron-builder": "^24.6.4",
+    "@types/node": "^20.0.0",
+    "typescript": "^5.0.0"
+  },
+  "build": {
+    "appId": "com.insuranceone.remote-agent",
+    "productName": "InsuranceOne Remote Assistance",
+    "files": [
+      "dist/**/*",
+      "node_modules/**/*"
+    ],
+    "win": {
+      "target": [
+        "nsis",
+        "portable"
+      ]
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true
+    }
+  }
+}

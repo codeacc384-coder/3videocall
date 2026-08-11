@@ -1,0 +1,6 @@
+{
+  "name": "IndiaFirst Life Insurance",
+  "description": "Enterprise Insurance Collaboration Platform for IndiaFirst Life Insurance with portals for Customers, Advisors, Officers, and Admins.",
+  "requestFramePermissions": ["camera", "microphone"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
