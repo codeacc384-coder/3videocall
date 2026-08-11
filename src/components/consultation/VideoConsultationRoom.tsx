@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useMemo, useCallback } from 'react';
 import {
   MeetingProvider,
   useMeeting,
@@ -13,13 +13,11 @@ import { supabase } from '../../lib/supabase';
 import { uploadAttachment } from '../../lib/uploadAttachment';
 import { PortalRole } from '../../types/insurance';
 import { useRemoteControl } from '../../hooks/useRemoteControl';
-import { useRemoteAgent } from '../../hooks/useRemoteAgent';
 import { RemoteControlButton } from './RemoteControlButton';
 import { RequestControlButton } from './RequestControlButton';
 import { ReleaseControlButton } from './ReleaseControlButton';
 import { RemoteControlRequestModal } from './RemoteControlBanner';
 import { RemoteControlBanner } from './RemoteControlBannerComponent';
-import { RemoteScreenController } from './RemoteScreenController';
 import { SharedScreenView } from './SharedScreenView';
 
 // ─── Types ───────────────────────────────────────────────────────────────────
@@ -115,61 +113,74 @@ const MeetingRoom: React.FC<{
   currentUserRole: PortalRole;
   onClose: () => void;
 }> = ({ roomId, title, currentUserId, currentUserName, currentUserRole, onClose }) => {
-  // PubSub/data handler ref — assigned below so onData can call into it synchronously
-  const pubsubHandlerRef = useRef<(data: { from: string; timestamp: string; payload: string | Uint8Array }) => void>(() => {});
-
   const meetingApi = useMeeting({
     onMeetingJoined: () => setJoined(true),
-    onMeetingLeft: () => { setJoined(false); onClose(); },
-    onData: (d: any) => {
-      try {
-        pubsubHandlerRef.current(d);
-      } catch (err) {
-        console.error('[PubSub] onData handler error', err);
-      }
-    }
+    onMeetingLeft: () => {
+      setJoined(false);
+      onClose();
+    },
   }) as any;
-  const { join, leave, toggleMic, toggleWebcam, participants, localMicOn, localWebcamOn, localParticipant, enableScreenShare, disableScreenShare } = meetingApi as any;
+
+  const {
+    join,
+    leave,
+    toggleMic,
+    toggleWebcam,
+    participants,
+    localMicOn,
+    localWebcamOn,
+    localParticipant,
+    enableScreenShare,
+    disableScreenShare,
+  } = meetingApi as any;
 
   const [joined, setJoined] = useState(false);
   const [joining, setJoining] = useState(false);
   const [activeTab, setActiveTab] = useState<'chat' | 'participants' | 'notes' | 'forms'>('chat');
   const [isScreenSharing, setIsScreenSharing] = useState(false);
-  const [screenStream, setScreenStream] = useState<MediaStream | null>(null);
   const [customerParticipantId, setCustomerParticipantId] = useState<string | null>(null);
   const [customerUserId, setCustomerUserId] = useState<string | null>(null);
   const [showRequestModal, setShowRequestModal] = useState(false);
-  const agentStatus = useRemoteAgent();
+  const [remoteAssistError, setRemoteAssistError] = useState<string | null>(null);
+
   const remoteControl = useRemoteControl(
     roomId,
     currentUserId,
-    currentUserRole,
-    (requesterName, requesterRole) => {
+    currentUserRole as 'customer' | 'officer' | 'advisor',
+    () => {
+      setRemoteAssistError(null);
       setShowRequestModal(true);
     },
-    (controllerName, controllerRole) => {
-      console.log('Control granted to:', controllerName);
+    (controllerName) => {
+      console.log('[RemoteControl] Control active for:', controllerName || currentUserName);
     },
     () => {
-      console.log('Control stopped');
+      console.log('[RemoteControl] Control stopped');
     }
   );
 
   const REMOTE_CONTROL_TOPIC = 'REMOTE_CONTROL_SIGNAL';
 
-  const publishSignal = async (payload: any) => {
-    try {
-      if (meetingApi?.publish) return await meetingApi.publish(REMOTE_CONTROL_TOPIC, payload);
-      if (meetingApi?.meeting?.publish) return await meetingApi.meeting.publish(REMOTE_CONTROL_TOPIC, payload);
-      if (meetingApi?.pubSub?.publish) return await meetingApi.pubSub.publish(REMOTE_CONTROL_TOPIC, payload);
-      console.warn('[PubSub] publish not available on meetingApi');
-    } catch (err) { console.error('[PubSub] publish failed', err); }
-  };
+  const publishSignal = useCallback(
+    async (payload: any, sendOnly: string[] = []) => {
+      const pubSub = meetingApi?.pubSub;
 
-  // subscribeSignal is intentionally a no-op — we use useMeeting's onData instead
-  const subscribeSignal = (_handler: (msg: any) => void) => {
-    return () => {};
-  };
+      if (!pubSub?.publish) {
+        throw new Error('[PubSub] VideoSDK pubSub.publish is not available');
+      }
+
+      await pubSub.publish(
+        REMOTE_CONTROL_TOPIC,
+        JSON.stringify(payload),
+        {
+          persist: false,
+          sendOnly,
+        },
+        payload
+      );
+    },
+    [meetingApi]
+  );
 
   // ── Shared chat (Supabase realtime) ──
   const [messages, setMessages] = useState<ChatMessage[]>([]);
@@ -187,45 +198,165 @@ const MeetingRoom: React.FC<{
   const [meetingNotes, setMeetingNotes] = useState('My Notes:\n');
 
   const participantList = [...participants.values()];
-  const participantRoles: Record<string, PortalRole> = {};
-  participantList.forEach((p, i) => {
-    const roleMap: PortalRole[] = ['customer', 'advisor', 'officer'];
-    participantRoles[p.id] = roleMap[i] || 'customer';
-  });
 
-  // Derive participant metadata mapping (customer participant and user id)
-  useEffect(() => {
-    participantList.forEach(p => {
-      const meta = (p as any).metaData || (p as any).metadata || {};
-      if (meta && meta.role === 'customer') {
-        setCustomerParticipantId(p.id);
-        setCustomerUserId(meta.userId || null);
-        if (meta.userId) remoteControl.setCustomerId(meta.userId);
+  const participantInfo = useMemo(() => {
+    const roles: Record<string, PortalRole> = {};
+    const userIds: Record<string, string> = {};
+    let resolvedCustomerParticipantId: string | null = null;
+    let resolvedCustomerUserId: string | null = null;
+
+    participantList.forEach((p: any) => {
+      const metadata = p?.metaData || p?.metadata || {};
+      const participantId = p.id as string;
+
+      let role = metadata?.role as PortalRole | undefined;
+      let userId = metadata?.userId as string | undefined;
+
+      if (participantId === localParticipant?.id || participantId === currentUserId) {
+        role = currentUserRole;
+        userId = currentUserId;
+      }
+
+      if (role) {
+        roles[participantId] = role;
+      }
+
+      if (userId) {
+        userIds[participantId] = userId;
+      }
+
+      if (role === 'customer') {
+        resolvedCustomerParticipantId = participantId;
+        resolvedCustomerUserId = userId || participantId;
       }
     });
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [participants.size]);
 
-  // Presenter view: top-level component to render the current presenter (screen sharer)
-  const PresenterScreenView: React.FC<{ presenterId: string | null }> = ({ presenterId }) => {
-    if (!presenterId) return null;
-    // useParticipant must be called at top level of component
+    if (currentUserRole === 'customer') {
+      const localId = localParticipant?.id || currentUserId;
+      roles[localId] = 'customer';
+      userIds[localId] = currentUserId;
+      resolvedCustomerParticipantId = localId;
+      resolvedCustomerUserId = currentUserId;
+    }
+
+    return {
+      roles,
+      userIds,
+      customerParticipantId: resolvedCustomerParticipantId,
+      customerUserId: resolvedCustomerUserId,
+    };
+  }, [
+    participantList.map((p: any) => p.id).join('|'),
+    localParticipant?.id,
+    currentUserId,
+    currentUserRole,
+  ]);
+
+  const participantRoles = participantInfo.roles;
+
+  useEffect(() => {
+    if (participantInfo.customerParticipantId) {
+      setCustomerParticipantId(participantInfo.customerParticipantId);
+    }
+
+    if (participantInfo.customerUserId) {
+      setCustomerUserId(participantInfo.customerUserId);
+      remoteControl.setCustomerId(participantInfo.customerUserId);
+    }
+  }, [
+    participantInfo.customerParticipantId,
+    participantInfo.customerUserId,
+  ]);
+
+  const getParticipantIdByUserId = useCallback(
+    (userId?: string | null): string | null => {
+      if (!userId) return null;
+
+      for (const [participantId, mappedUserId] of Object.entries(participantInfo.userIds)) {
+        if (mappedUserId === userId) {
+          return participantId;
+        }
+      }
+
+      const direct = participantList.find((p: any) => p.id === userId);
+      return direct?.id || null;
+    },
+    [participantInfo.userIds, participantList]
+  );
+
+  useEffect(() => {
+    if (!joined) return;
+
+    const pubSub = meetingApi?.pubSub;
+    if (!pubSub?.subscribe || !pubSub?.unsubscribe) {
+      console.error('[PubSub] VideoSDK pubSub subscribe API is unavailable');
+      return;
+    }
+
+    const onRemoteControlMessage = (message: any) => {
+      try {
+        let payload = message?.payload;
+
+        if (!payload || typeof payload !== 'object') {
+          const raw = message?.message;
+          if (typeof raw === 'string') {
+            payload = JSON.parse(raw);
+          }
+        }
+
+        if (!payload || typeof payload !== 'object') {
+          return;
+        }
+
+        void remoteControl.handleSignalingEvent(payload as any);
+      } catch (err) {
+        console.error('[PubSub] Failed to process remote-control signal:', err);
+      }
+    };
+
+    let cancelled = false;
+
+    void pubSub
+      .subscribe(REMOTE_CONTROL_TOPIC, onRemoteControlMessage)
+      .then(() => {
+        if (!cancelled) {
+          console.log('[PubSub] Subscribed:', REMOTE_CONTROL_TOPIC);
+        }
+      })
+      .catch((err: unknown) => {
+        console.error('[PubSub] Subscribe failed:', err);
+      });
+
+    return () => {
+      cancelled = true;
+      void pubSub.unsubscribe(REMOTE_CONTROL_TOPIC, onRemoteControlMessage).catch(() => {});
+    };
+  }, [joined, meetingApi, remoteControl.handleSignalingEvent]);
+
+  // Presenter view: only rendered when presenterId is non-null.
+  const PresenterScreenView: React.FC<{ presenterId: string }> = ({ presenterId }) => {
     const participant = useParticipant(presenterId) as any;
-    const screenShareOn = participant?.screenShareOn;
+    const screenShareOn = Boolean(participant?.screenShareOn);
     const screenShareStream = participant?.screenShareStream;
 
-    const mediaStream = (screenShareOn && screenShareStream && screenShareStream.track)
-      ? new MediaStream([screenShareStream.track])
-      : null;
+    const mediaStream = useMemo(() => {
+      const track = screenShareStream?.track;
+      if (!screenShareOn || !track) return null;
+      return new MediaStream([track]);
+    }, [screenShareOn, screenShareStream?.track]);
 
     return (
       <SharedScreenView
         screenStream={mediaStream}
-        isControlActive={remoteControl.state.controlAllowed}
+        isControlActive={
+          remoteControl.state.status === 'active' &&
+          remoteControl.state.controlAllowed &&
+          currentUserRole !== 'customer'
+        }
         meetingId={roomId}
         customerId={customerUserId || ''}
         controllerId={remoteControl.state.controllerId || ''}
-        onSendEvent={(e) => remoteControl.sendControlEvent(e as any)}
+        onSendEvent={(event) => remoteControl.sendControlEvent(event as any)}
       />
     );
   };
@@ -307,118 +438,257 @@ const MeetingRoom: React.FC<{
   
 
   const handleToggleScreenShare = async () => {
+    if (currentUserRole !== 'customer') return;
+
     if (isScreenSharing) {
       try {
         await disableScreenShare?.();
-      } catch (e) { /* ignore */ }
+      } catch (err) {
+        console.warn('Stop screen share warning:', err);
+      }
+
       setIsScreenSharing(false);
       remoteControl.setScreenShareActive(false);
-    } else {
-      try {
-        await enableScreenShare?.();
-        setIsScreenSharing(true);
-        remoteControl.setScreenShareActive(true);
-      } catch (err) {
-        console.error('Screen share failed:', err);
-      }
+      return;
+    }
+
+    try {
+      await enableScreenShare?.();
+      setIsScreenSharing(true);
+      remoteControl.setScreenShareActive(true);
+    } catch (err) {
+      console.error('Screen share failed:', err);
+    }
+  };
+
+  const registerCustomerAgent = async (params: {
+    remoteSessionId: string;
+    meetingId: string;
+    customerId: string;
+    token: string;
+  }): Promise<void> => {
+    let response: Response;
+
+    try {
+      response = await fetch('http://127.0.0.1:9876/register', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify(params),
+      });
+    } catch {
+      throw new Error(
+        'Remote Assistance Agent is not running on the Customer laptop. Start the Agent and try again.'
+      );
+    }
+
+    let body: any = null;
+    try {
+      body = await response.json();
+    } catch {}
+
+    if (!response.ok) {
+      throw new Error(
+        body?.message ||
+          body?.error ||
+          `Remote Agent registration failed (HTTP ${response.status})`
+      );
+    }
+
+    if (body?.registered === false) {
+      throw new Error(body?.message || 'Remote Agent could not register with relay');
     }
   };
 
   const handleRequestControl = async () => {
     if (currentUserRole === 'customer') return;
+
+    setRemoteAssistError(null);
+
     try {
+      if (!customerUserId) {
+        throw new Error('Customer identity is not available yet');
+      }
+
       const session = await remoteControl.requestControl(currentUserName);
+
+      const customerVideoParticipantId =
+        customerParticipantId || getParticipantIdByUserId(customerUserId);
+
       const payload = {
         type: 'REQUEST_CONTROL',
         meetingId: roomId,
-        customerId: customerUserId || '',
+        customerId: customerUserId,
         requesterId: currentUserId,
         requesterName: currentUserName,
         requesterRole: currentUserRole,
-        remoteSessionId: session?.id,
+        databaseSessionId: session.id,
+        remoteSessionId: session.remote_session_id,
         timestamp: Date.now(),
-      } as any;
-      await publishSignal(payload);
+      };
+
+      await publishSignal(
+        payload,
+        customerVideoParticipantId ? [customerVideoParticipantId] : []
+      );
+
+      console.log('[RemoteControl] REQUEST_CONTROL published');
     } catch (err) {
+      const message =
+        err instanceof Error ? err.message : 'Request control failed';
+
+      setRemoteAssistError(message);
       console.error('Request control failed', err);
     }
   };
 
   const handleApproveControl = async () => {
+    setRemoteAssistError(null);
+
     try {
-      const session = await remoteControl.approveControl(remoteControl.state.remoteSessionId || '');
-      if (!session) throw new Error('Approve returned no session');
+      const result = await remoteControl.approveControl(
+        remoteControl.state.databaseSessionId || undefined
+      );
 
-      const payload: any = {
-        type: 'CONTROL_GRANTED',
+      if (!result) {
+        throw new Error('Approve returned no authorization result');
+      }
+
+      const { session, authorization } = result;
+
+      const customerId = session.customer_id || customerUserId || currentUserId;
+      const controllerId =
+        session.requester_id || remoteControl.state.requesterId || '';
+      const controllerRole =
+        session.requester_role || remoteControl.state.requesterRole || 'officer';
+
+      if (!controllerId) {
+        throw new Error('Approved controller ID is missing');
+      }
+
+      await registerCustomerAgent({
+        remoteSessionId: authorization.remoteSessionId,
         meetingId: roomId,
-        customerId: customerUserId || '',
-        controllerId: session.requester_id || remoteControl.state.requesterId || '',
-        controllerRole: session.requester_role || 'officer',
-        remoteSessionId: session.remote_session_id,
-      };
-      if ((session as any).controller_token) payload.controllerToken = (session as any).controller_token;
-      if ((session as any).agent_token) payload.agentToken = (session as any).agent_token;
+        customerId,
+        token: authorization.agentToken,
+      });
 
-      await publishSignal(payload);
+      remoteControl.setAgentRegistered(true);
+
+      const controllerParticipantId = getParticipantIdByUserId(controllerId);
+
+      await publishSignal(
+        {
+          type: 'CONTROL_GRANTED',
+          meetingId: roomId,
+          customerId,
+          controllerId,
+          controllerName: remoteControl.state.requesterName || '',
+          controllerRole,
+          databaseSessionId: session.id,
+          remoteSessionId: authorization.remoteSessionId,
+          controllerToken: authorization.controllerToken,
+          timestamp: Date.now(),
+        },
+        controllerParticipantId ? [controllerParticipantId] : []
+      );
+
       setShowRequestModal(false);
+
+      console.log(
+        '[RemoteControl] Agent registered; CONTROL_GRANTED sent to approved controller'
+      );
     } catch (err) {
+      const message =
+        err instanceof Error ? err.message : 'Approve control failed';
+
+      setRemoteAssistError(message);
       console.error('Approve control failed', err);
     }
   };
 
   const handleRejectControl = async () => {
+    setRemoteAssistError(null);
+
     try {
-      await remoteControl.rejectControl(remoteControl.state.remoteSessionId || '');
-      await publishSignal({
-        type: 'CONTROL_REJECTED',
-        meetingId: roomId,
-        customerId: customerUserId || '',
-        requesterId: remoteControl.state.requesterId || '',
-      });
+      const requesterId = remoteControl.state.requesterId;
+
+      await remoteControl.rejectControl(
+        remoteControl.state.databaseSessionId || undefined
+      );
+
+      const requesterParticipantId = getParticipantIdByUserId(requesterId);
+
+      await publishSignal(
+        {
+          type: 'CONTROL_REJECTED',
+          meetingId: roomId,
+          customerId: customerUserId || currentUserId,
+          requesterId: requesterId || '',
+          databaseSessionId: remoteControl.state.databaseSessionId,
+          remoteSessionId: remoteControl.state.remoteSessionId,
+          timestamp: Date.now(),
+        },
+        requesterParticipantId ? [requesterParticipantId] : []
+      );
+
       setShowRequestModal(false);
     } catch (err) {
+      const message =
+        err instanceof Error ? err.message : 'Reject control failed';
+
+      setRemoteAssistError(message);
       console.error('Reject control failed', err);
     }
   };
 
-  const handleStopControl = async () => {
-    try {
-      await remoteControl.stopControl(remoteControl.state.remoteSessionId || '');
-      await publishSignal({
+  const publishStoppedSignal = async (
+    reason: 'customer_stopped' | 'controller_released' | 'screen_share_stopped'
+  ) => {
+    const otherUserId =
+      currentUserRole === 'customer'
+        ? remoteControl.state.controllerId
+        : remoteControl.state.customerId;
+
+    const otherParticipantId = getParticipantIdByUserId(otherUserId);
+
+    await publishSignal(
+      {
         type: 'CONTROL_STOPPED',
         meetingId: roomId,
         remoteSessionId: remoteControl.state.remoteSessionId,
-        reason: 'customer_stopped',
-      });
-    } catch (err) {
-      console.error('Stop control failed', err);
-    }
+        databaseSessionId: remoteControl.state.databaseSessionId,
+        reason,
+        timestamp: Date.now(),
+      },
+      otherParticipantId ? [otherParticipantId] : []
+    );
   };
-  
+
   const handleCustomerStop = async () => {
     try {
-      await remoteControl.stopControl(remoteControl.state.remoteSessionId || '', 'customer_stopped');
-      await publishSignal({
-        type: 'CONTROL_STOPPED',
-        meetingId: roomId,
-        remoteSessionId: remoteControl.state.remoteSessionId,
-        reason: 'customer_stopped',
-      });
+      await remoteControl.stopControl(
+        remoteControl.state.databaseSessionId || undefined,
+        'customer_stopped'
+      );
+
+      await publishStoppedSignal('customer_stopped');
     } catch (err) {
-      console.error('Stop control failed', err);
+      console.error('Customer stop control failed', err);
     }
   };
-  
+
+  const handleStopControl = handleCustomerStop;
+
   const handleReleaseControl = async () => {
     try {
-      await remoteControl.stopControl(remoteControl.state.remoteSessionId || '', 'controller_released');
-      await publishSignal({
-        type: 'CONTROL_STOPPED',
-        meetingId: roomId,
-        remoteSessionId: remoteControl.state.remoteSessionId,
-        reason: 'controller_released',
-      });
+      await remoteControl.stopControl(
+        remoteControl.state.databaseSessionId || undefined,
+        'controller_released'
+      );
+
+      await publishStoppedSignal('controller_released');
     } catch (err) {
       console.error('Release control failed', err);
     }
@@ -466,6 +736,20 @@ const MeetingRoom: React.FC<{
 
   return (
     <div className="fixed inset-0 z-50 bg-slate-950 text-white flex flex-col font-sans overflow-hidden">
+      {remoteAssistError && (
+        <div className="absolute top-16 left-1/2 -translate-x-1/2 z-[80] max-w-xl w-[calc(100%-2rem)] bg-red-950 border border-red-700 text-red-100 rounded-xl px-4 py-3 shadow-2xl flex items-start justify-between gap-3">
+          <div>
+            <p className="text-xs font-bold">Remote Assistance Error</p>
+            <p className="text-xs text-red-200 mt-1">{remoteAssistError}</p>
+          </div>
+          <button
+            onClick={() => setRemoteAssistError(null)}
+            className="text-red-300 hover:text-white"
+          >
+            <X className="w-4 h-4" />
+          </button>
+        </div>
+      )}
       <RemoteControlBanner
         isActive={remoteControl.state.status === 'active'}
         controllerName={remoteControl.state.controllerName || ''}
@@ -502,7 +786,7 @@ const MeetingRoom: React.FC<{
         <div className="flex-1 flex flex-col p-4 gap-4 overflow-hidden">
           {/* If any participant is screen-sharing, render the shared screen as the main view */}
           {(() => {
-            const presenterId = (meetingApi as any)?.presenterId || null;
+            const presenterId = (meetingApi as any)?.presenterId || (meetingApi as any)?.activePresenterId || null;
             if (presenterId) {
               return (
                 <div className="flex-1 flex flex-col gap-4 min-h-0">
@@ -580,7 +864,7 @@ const MeetingRoom: React.FC<{
 
             <div className="flex items-center gap-2">
                 {(() => {
-                  const presenterId = (meetingApi as any)?.presenterId || null;
+                  const presenterId = (meetingApi as any)?.presenterId || (meetingApi as any)?.activePresenterId || null;
                   const customerScreenShareActive = presenterId !== null && presenterId === customerParticipantId;
                   return (
                     <RequestControlButton

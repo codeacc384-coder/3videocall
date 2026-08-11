@@ -1,909 +1,1638 @@
-import { useState, useCallback, useEffect, useRef } from 'react';
 import {
+  useState,
+  useCallback,
+  useEffect,
+  useRef,
+} from 'react';
+
+import type {
   RemoteControlState,
   RemoteControlEvent,
   ControllerRole,
+  RemoteControlSession,
+  RemoteControlAuthorization,
+  ControlStopRelayMessage,
+  ControlEventRelayMessage,
+  ControllerRegisterRelayMessage,
 } from '../types/remoteControl';
-import { RemoteControlService } from '../services/remoteControlService';
-import { RemoteControlSocket } from '../services/remoteControlSocket';
 
+import {
+  RemoteControlService,
+} from '../services/remoteControlService';
+
+import {
+  RemoteControlSocket,
+} from '../services/remoteControlSocket';
+
+/**
+ * ------------------------------------------------------------
+ * INITIAL STATE
+ * ------------------------------------------------------------
+ */
 const initialState: RemoteControlState = {
   status: 'idle',
+
   customerId: null,
+
   requesterId: null,
   requesterName: null,
   requesterRole: null,
+
   controllerId: null,
   controllerName: null,
   controllerRole: null,
+
   controlAllowed: false,
+
+  /**
+   * Render relay remote_session_id.
+   */
   remoteSessionId: null,
+
+  /**
+   * Supabase remote_control_sessions.id.
+   */
+  databaseSessionId: null,
+
   screenShareActive: false,
+
+  agentRegistered: false,
+  controllerRegistered: false,
 };
 
-type SignalingEvent = RemoteControlEvent & {
-  requesterName?: string;
-  controllerName?: string;
-  controllerToken?: string;
-  remoteSessionId?: string;
-  reason?: string;
-};
+/**
+ * Meeting signaling payload.
+ *
+ * This is passed from VideoConsultationRoom after receiving
+ * VideoSDK onData signaling messages.
+ */
+export type RemoteControlSignalingEvent =
+  RemoteControlEvent & {
+    /**
+     * Supabase DB row ID.
+     *
+     * Customer needs this when clicking Accept / Reject.
+     */
+    databaseSessionId?: string;
+
+    requesterName?: string;
+
+    controllerName?: string;
+
+    controllerToken?: string;
+
+    agentToken?: string;
+
+    reason?: string;
+  };
+
+/**
+ * Result returned after Customer approves a request.
+ *
+ * VideoConsultationRoom will use:
+ *
+ * session
+ * authorization.agentToken
+ * authorization.controllerToken
+ */
+export interface ApproveControlResult {
+  session: RemoteControlSession;
+
+  authorization:
+    RemoteControlAuthorization;
+}
 
 export function useRemoteControl(
   meetingId: string,
+
   currentUserId: string,
-  currentUserRole: 'customer' | 'officer' | 'adviser',
+
+  currentUserRole:
+    | 'customer'
+    | 'officer'
+    | 'advisor',
+
   onRequestReceived?: (
     requesterName: string,
     requesterRole: ControllerRole
   ) => void,
+
   onControlGranted?: (
     controllerName: string,
     controllerRole: ControllerRole
   ) => void,
+
   onControlStopped?: () => void
 ) {
   const [state, setState] =
-    useState<RemoteControlState>(initialState);
-
-  const socketRef =
-    useRef<RemoteControlSocket | null>(null);
-
-  const initRef = useRef(false);
-
-  /**
-   * Keep latest state available inside WebSocket callbacks.
-   * This avoids stale React closure values.
-   */
-  const stateRef = useRef(state);
-  stateRef.current = state;
-
-  /**
-   * ------------------------------------------------------------
-   * RELAY SOCKET INITIALIZATION
-   * ------------------------------------------------------------
-   *
-   * The Render relay is ONLY used for:
-   *
-   * CONTROLLER_REGISTER
-   * CONTROL_EVENT
-   * CONTROL_STOP
-   *
-   * REQUEST_CONTROL / CONTROL_GRANTED / CONTROL_REJECTED /
-   * CONTROL_STOPPED should come from VideoSDK PubSub and be passed
-   * to handleSignalingEvent().
-   */
-  useEffect(() => {
-    if (initRef.current) return;
-
-    initRef.current = true;
-
-    try {
-      const socket = RemoteControlSocket.getInstance();
-
-      socketRef.current = socket;
-
-      /**
-       * Render has accepted controller registration.
-       *
-       * Important:
-       * The current Render implementation may only return:
-       *
-       * {
-       *   type: "CONTROLLER_REGISTERED",
-       *   remoteSessionId
-       * }
-       *
-       * Therefore do NOT require event.controllerId here.
-       */
-      socket.on(
-        'CONTROLLER_REGISTERED',
-        (event: RemoteControlEvent) => {
-          if (currentUserRole === 'customer') return;
-
-          const currentSessionId =
-            stateRef.current.remoteSessionId;
-
-          if (
-            event.remoteSessionId &&
-            currentSessionId &&
-            event.remoteSessionId !== currentSessionId
-          ) {
-            return;
-          }
-
-          setState((prev) => ({
-            ...prev,
-            status: 'active',
-            controlAllowed: true,
-            controllerId: currentUserId,
-            controllerRole:
-              currentUserRole as ControllerRole,
-          }));
-
-          onControlGranted?.(
-            stateRef.current.controllerName || '',
-            currentUserRole as ControllerRole
-          );
-
-          console.log(
-            '[RemoteControl] Controller registered with relay'
-          );
-        }
-      );
-
-      /**
-       * Render rejected controller/control request.
-       */
-      socket.on(
-        'CONTROL_DENIED',
-        (event: RemoteControlEvent) => {
-          if (currentUserRole === 'customer') return;
-
-          const currentSessionId =
-            stateRef.current.remoteSessionId;
-
-          if (
-            event.remoteSessionId &&
-            currentSessionId &&
-            event.remoteSessionId !== currentSessionId
-          ) {
-            return;
-          }
-
-          console.warn(
-            '[RemoteControl] Control denied by relay'
-          );
-
-          setState((prev) => ({
-            ...prev,
-            status: 'rejected',
-            controlAllowed: false,
-          }));
-
-          setTimeout(() => {
-            setState((prev) => ({
-              ...prev,
-              status: 'idle',
-            }));
-          }, 2000);
-        }
-      );
-
-      /**
-       * Invalid controller token.
-       */
-      socket.on('INVALID_TOKEN', () => {
-        console.error(
-          '[RemoteControl] Relay rejected token'
-        );
-
-        setState((prev) => ({
-          ...prev,
-          status: 'ended',
-          controlAllowed: false,
-        }));
-      });
-
-      /**
-       * Remote session expired.
-       */
-      socket.on('SESSION_EXPIRED', () => {
-        console.warn(
-          '[RemoteControl] Remote session expired'
-        );
-
-        setState((prev) => ({
-          ...prev,
-          status: 'ended',
-          controlAllowed: false,
-          controllerId: null,
-          controllerName: null,
-          controllerRole: null,
-        }));
-
-        onControlStopped?.();
-
-        setTimeout(() => {
-          setState((prev) => ({
-            ...prev,
-            status: 'idle',
-          }));
-        }, 1000);
-      });
-
-      /**
-       * Relay tells us remote control stopped.
-       */
-      socket.on(
-        'CONTROL_STOPPED',
-        (event: RemoteControlEvent) => {
-          const currentSessionId =
-            stateRef.current.remoteSessionId;
-
-          if (
-            event.remoteSessionId &&
-            currentSessionId &&
-            event.remoteSessionId !== currentSessionId
-          ) {
-            return;
-          }
-
-          console.log(
-            '[RemoteControl] Control stopped by relay'
-          );
-
-          setState((prev) => ({
-            ...prev,
-            status: 'ended',
-            controlAllowed: false,
-            controllerId: null,
-            controllerName: null,
-            controllerRole: null,
-          }));
-
-          onControlStopped?.();
-
-          setTimeout(() => {
-            setState((prev) => ({
-              ...prev,
-              status: 'idle',
-            }));
-          }, 1000);
-        }
-      );
-
-      socket.connect().catch(() => {
-        console.log(
-          '[RemoteControl] Could not connect to relay'
-        );
-      });
-    } catch (err) {
-      console.warn(
-        '[RemoteControl] Relay not configured:',
-        (err as Error).message
-      );
-    }
-
-    // Socket is a shared singleton.
-    // Do not disconnect it here on ordinary component rerenders.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
-
-  /**
-   * ------------------------------------------------------------
-   * VIDEOSDK PUBSUB SIGNALING EVENTS
-   * ------------------------------------------------------------
-   *
-   * VideoConsultationRoom should subscribe to:
-   *
-   * REMOTE_CONTROL_SIGNAL
-   *
-   * and feed incoming messages here.
-   */
-  const handleSignalingEvent = useCallback(
-    (event: SignalingEvent) => {
-      try {
-        /**
-         * Officer/Adviser asks Customer for permission.
-         */
-        if (event.type === 'REQUEST_CONTROL') {
-          if (currentUserRole !== 'customer') return;
-
-          setState((prev) => ({
-            ...prev,
-            status: 'requested',
-            requesterId: event.requesterId || null,
-            requesterName:
-              event.requesterName || null,
-            requesterRole:
-              event.requesterRole || null,
-            remoteSessionId:
-              event.remoteSessionId || null,
-          }));
-
-          onRequestReceived?.(
-            event.requesterName || '',
-            event.requesterRole || 'officer'
-          );
-
-          return;
-        }
-
-        /**
-         * Customer approved the request.
-         *
-         * Do NOT set active here.
-         *
-         * Officer/Adviser still needs to register with Render.
-         * Active state is set only after CONTROLLER_REGISTERED.
-         */
-        if (event.type === 'CONTROL_GRANTED') {
-          if (currentUserRole === 'customer') return;
-
-          if (
-            event.controllerId &&
-            event.controllerId !== currentUserId
-          ) {
-            return;
-          }
-
-          setState((prev) => ({
-            ...prev,
-            status: 'requested',
-            controllerId:
-              event.controllerId || currentUserId,
-            controllerName:
-              event.controllerName ||
-              prev.controllerName,
-            controllerRole:
-              event.controllerRole ||
-              (currentUserRole as ControllerRole),
-            remoteSessionId:
-              event.remoteSessionId ||
-              prev.remoteSessionId,
-            controlAllowed: false,
-          }));
-
-          console.log(
-            '[RemoteControl] Control granted; waiting for relay registration'
-          );
-
-          return;
-        }
-
-        /**
-         * Customer rejected control request.
-         */
-        if (event.type === 'CONTROL_REJECTED') {
-          if (currentUserRole === 'customer') return;
-
-          if (
-            event.requesterId &&
-            event.requesterId !== currentUserId
-          ) {
-            return;
-          }
-
-          setState((prev) => ({
-            ...prev,
-            status: 'rejected',
-            controlAllowed: false,
-          }));
-
-          setTimeout(() => {
-            setState((prev) => ({
-              ...prev,
-              status: 'idle',
-            }));
-          }, 2000);
-
-          return;
-        }
-
-        /**
-         * Meeting-level notification that control stopped.
-         */
-        if (event.type === 'CONTROL_STOPPED') {
-          setState((prev) => ({
-            ...prev,
-            status: 'ended',
-            controlAllowed: false,
-            controllerId: null,
-            controllerName: null,
-            controllerRole: null,
-          }));
-
-          onControlStopped?.();
-
-          setTimeout(() => {
-            setState((prev) => ({
-              ...prev,
-              status: 'idle',
-            }));
-          }, 1000);
-        }
-      } catch (err) {
-        console.error(
-          '[RemoteControl] handleSignalingEvent failed:',
-          err
-        );
-      }
-    },
-    [
-      currentUserId,
-      currentUserRole,
-      onRequestReceived,
-      onControlStopped,
-    ]
-  );
-
-  /**
-   * ------------------------------------------------------------
-   * REQUEST CONTROL
-   * ------------------------------------------------------------
-   *
-   * Officer / Adviser creates the DB request.
-   *
-   * The caller must then publish REQUEST_CONTROL using
-   * VideoSDK PubSub.
-   */
-  const requestControl = useCallback(
-    async (requesterName: string) => {
-      if (currentUserRole === 'customer') {
-        return;
-      }
-
-      const { customerId } = stateRef.current;
-
-      if (!customerId) {
-        throw new Error(
-          'Customer ID is not available'
-        );
-      }
-
-      try {
-        setState((prev) => ({
-          ...prev,
-          status: 'requesting',
-        }));
-
-        const session =
-          await RemoteControlService.createControlRequest(
-            meetingId,
-            customerId,
-            currentUserId,
-            currentUserRole as ControllerRole
-          );
-
-        setState((prev) => ({
-          ...prev,
-          status: 'requested',
-          requesterId: currentUserId,
-          requesterName,
-          requesterRole:
-            currentUserRole as ControllerRole,
-          /**
-           * This may initially be the DB request/session row ID.
-           * Customer approval can later replace it with the final
-           * remote_session_id.
-           */
-          remoteSessionId: session.id,
-        }));
-
-        return session;
-      } catch (err) {
-        console.error(
-          '[RemoteControl] Request failed:',
-          err
-        );
-
-        setState((prev) => ({
-          ...prev,
-          status: 'idle',
-        }));
-
-        throw err;
-      }
-    },
-    [
-      meetingId,
-      currentUserId,
-      currentUserRole,
-    ]
-  );
-
-  /**
-   * ------------------------------------------------------------
-   * APPROVE CONTROL
-   * ------------------------------------------------------------
-   *
-   * THIS was the corrupted section in your uploaded file.
-   *
-   * Customer approves the request in the database.
-   *
-   * Caller should then publish CONTROL_GRANTED using VideoSDK
-   * PubSub and provide the controller with its short-lived token.
-   */
-  const approveControl = useCallback(
-    async (sessionId: string) => {
-      if (currentUserRole !== 'customer') {
-        return;
-      }
-
-      const {
-        requesterId,
-        requesterName,
-        requesterRole,
-      } = stateRef.current;
-
-      if (!requesterId) {
-        throw new Error(
-          'No requester is available to approve'
-        );
-      }
-
-      try {
-        const session =
-          await RemoteControlService.approveControlRequest(
-            sessionId,
-            requesterId
-          );
-
-        /**
-         * Customer has approved.
-         *
-         * We keep controlAllowed false until the controller
-         * successfully registers with the relay.
-         *
-         * UI/PubSub can use this returned session to publish
-         * CONTROL_GRANTED.
-         */
-        setState((prev) => ({
-          ...prev,
-          status: 'requested',
-          controllerId: requesterId,
-          controllerName: requesterName,
-          controllerRole: requesterRole,
-          controlAllowed: false,
-          remoteSessionId:
-            session.remote_session_id ||
-            prev.remoteSessionId,
-        }));
-
-        console.log(
-          '[RemoteControl] Customer approved control request'
-        );
-
-        return session;
-      } catch (err) {
-        console.error(
-          '[RemoteControl] Approval failed:',
-          err
-        );
-
-        throw err;
-      }
-    },
-    [currentUserRole]
-  );
-
-  /**
-   * ------------------------------------------------------------
-   * REJECT CONTROL
-   * ------------------------------------------------------------
-   */
-  const rejectControl = useCallback(
-    async (sessionId: string) => {
-      if (currentUserRole !== 'customer') {
-        return false;
-      }
-
-      try {
-        await RemoteControlService.rejectControlRequest(
-          sessionId
-        );
-
-        setState((prev) => ({
-          ...prev,
-          status: 'rejected',
-          controlAllowed: false,
-        }));
-
-        /**
-         * Caller should publish CONTROL_REJECTED through
-         * VideoSDK PubSub.
-         */
-        setTimeout(() => {
-          setState((prev) => ({
-            ...prev,
-            status: 'idle',
-            requesterId: null,
-            requesterName: null,
-            requesterRole: null,
-          }));
-        }, 2000);
-
-        return true;
-      } catch (err) {
-        console.error(
-          '[RemoteControl] Rejection failed:',
-          err
-        );
-
-        return false;
-      }
-    },
-    [currentUserRole]
-  );
-
-  /**
-   * ------------------------------------------------------------
-   * STOP / RELEASE CONTROL
-   * ------------------------------------------------------------
-   *
-   * Can be called by:
-   *
-   * Customer -> STOP CONTROL
-   * Officer/Adviser -> RELEASE CONTROL
-   */
-  const stopControl = useCallback(
-    async (
-      sessionId: string,
-      reason: string = 'stopped'
-    ) => {
-      try {
-        /**
-         * Update persisted DB session where possible.
-         */
-        if (sessionId) {
-          await RemoteControlService.stopControl(
-            sessionId
-          ).catch(() => {
-            // We still stop relay/UI state even if DB update fails.
-          });
-        }
-
-        /**
-         * Notify Render relay.
-         */
-        const relaySessionId =
-          stateRef.current.remoteSessionId;
-
-        const socket = socketRef.current;
-
-        if (
-          relaySessionId &&
-          socket?.isConnected()
-        ) {
-          socket.send({
-            type: 'CONTROL_STOP',
-            remoteSessionId: relaySessionId,
-            reason,
-          } as any);
-        }
-
-        setState((prev) => ({
-          ...prev,
-          status: 'ended',
-          controlAllowed: false,
-          controllerId: null,
-          controllerName: null,
-          controllerRole: null,
-        }));
-
-        onControlStopped?.();
-
-        /**
-         * Caller should also publish CONTROL_STOPPED using
-         * VideoSDK PubSub so all participants update their UI.
-         */
-        setTimeout(() => {
-          setState((prev) => ({
-            ...prev,
-            status: 'idle',
-          }));
-        }, 1000);
-      } catch (err) {
-        console.error(
-          '[RemoteControl] Stop failed:',
-          err
-        );
-      }
-    },
-    [onControlStopped]
-  );
-
-  /**
-   * ------------------------------------------------------------
-   * REGISTER OFFICER / ADVISER WITH RENDER RELAY
-   * ------------------------------------------------------------
-   *
-   * Called after CONTROL_GRANTED is received through VideoSDK
-   * PubSub and the controller has its short-lived token.
-   */
-  const registerControllerWithRelay =
-    useCallback(
-      async (
-        remoteSessionId: string,
-        controllerToken: string,
-        controllerId: string,
-        controllerRole: ControllerRole
-      ) => {
-        const socket = socketRef.current;
-
-        if (!socket) {
-          throw new Error(
-            'Remote-control relay socket is unavailable'
-          );
-        }
-
-        if (!socket.isConnected()) {
-          await socket.connect();
-        }
-
-        const message = {
-          type: 'CONTROLLER_REGISTER',
-          remoteSessionId,
-          meetingId,
-          controllerId,
-          controllerRole,
-          token: controllerToken,
-        };
-
-        /**
-         * Store pending session locally BEFORE sending.
-         *
-         * CONTROLLER_REGISTERED may only return
-         * remoteSessionId.
-         */
-        setState((prev) => ({
-          ...prev,
-          status: 'requested',
-          remoteSessionId,
-          controllerId,
-          controllerRole,
-          controlAllowed: false,
-        }));
-
-        socket.send(message as any);
-
-        console.log(
-          '[RemoteControl] Controller registration sent'
-        );
-
-        /**
-         * Do not set active here.
-         *
-         * socket.on("CONTROLLER_REGISTERED") does that.
-         */
-      },
-      [meetingId]
+    useState<RemoteControlState>(
+      initialState
     );
 
   /**
-   * ------------------------------------------------------------
-   * SEND MOUSE / KEYBOARD EVENT
-   * ------------------------------------------------------------
-   *
-   * Render expects:
-   *
-   * {
-   *   type: "CONTROL_EVENT",
-   *   remoteSessionId,
-   *   event: {...}
-   * }
+   * Always keep latest state accessible inside
+   * WebSocket callbacks.
    */
-  const sendControlEvent = useCallback(
-    (inputEvent: RemoteControlEvent) => {
-      const remoteSessionId =
-        stateRef.current.remoteSessionId;
+  const stateRef = useRef(state);
 
-      if (!remoteSessionId) {
-        return;
-      }
+  useEffect(() => {
+    stateRef.current = state;
+  }, [state]);
 
-      /**
-       * Only the active controller should send input.
-       */
+  /**
+   * Shared singleton Render relay connection.
+   */
+  const socketRef =
+    useRef<RemoteControlSocket | null>(
+      null
+    );
+
+  /**
+   * Prevent duplicate initialization.
+   */
+  const initializedRef =
+    useRef(false);
+
+  /**
+   * ------------------------------------------------------------
+   * RESET ACTIVE CONTROL STATE
+   * ------------------------------------------------------------
+   */
+  const resetActiveControl =
+    useCallback(() => {
+      setState((prev) => ({
+        ...prev,
+
+        status: 'idle',
+
+        controllerId: null,
+        controllerName: null,
+        controllerRole: null,
+
+        controlAllowed: false,
+
+        controllerRegistered: false,
+        agentRegistered: false,
+
+        requesterId: null,
+        requesterName: null,
+        requesterRole: null,
+
+        /**
+         * Keep customer ID because meeting remains active.
+         */
+        customerId: prev.customerId,
+
+        remoteSessionId: null,
+        databaseSessionId: null,
+      }));
+    }, []);
+
+  /**
+   * ------------------------------------------------------------
+   * RENDER RELAY INITIALIZATION
+   * ------------------------------------------------------------
+   */
+  useEffect(() => {
+    if (initializedRef.current) {
+      return;
+    }
+
+    initializedRef.current = true;
+
+    let socket:
+      | RemoteControlSocket
+      | null = null;
+
+    /**
+     * ----------------------------------------------------------
+     * CONTROLLER_REGISTERED
+     * ----------------------------------------------------------
+     *
+     * Render sends this ONLY after:
+     *
+     * Agent registered
+     * Controller registered
+     * controlAllowed = true
+     */
+    const handleControllerRegistered = (
+      event: RemoteControlEvent
+    ) => {
       if (
-        !stateRef.current.controlAllowed ||
-        stateRef.current.status !== 'active'
+        currentUserRole ===
+        'customer'
       ) {
         return;
       }
 
-      const socket = socketRef.current;
+      const expectedSession =
+        stateRef.current
+          .remoteSessionId;
 
-      if (!socket?.isConnected()) {
-        console.warn(
-          '[RemoteControl] Cannot send input: relay not connected'
-        );
-
+      if (
+        expectedSession &&
+        event.remoteSessionId &&
+        expectedSession !==
+          event.remoteSessionId
+      ) {
         return;
       }
 
-      socket.send({
-        type: 'CONTROL_EVENT',
-        remoteSessionId,
-        event: inputEvent,
-      } as any);
-    },
-    []
-  );
-
-  /**
-   * ------------------------------------------------------------
-   * SET REAL CUSTOMER USER ID
-   * ------------------------------------------------------------
-   */
-  const setCustomerId = useCallback(
-    (customerId: string) => {
-      if (!customerId) return;
-
-      setState((prev) => {
-        if (prev.customerId === customerId) {
-          return prev;
-        }
-
-        return {
-          ...prev,
-          customerId,
-        };
-      });
-    },
-    []
-  );
-
-  /**
-   * ------------------------------------------------------------
-   * SCREEN SHARE STATE
-   * ------------------------------------------------------------
-   *
-   * If Customer stops screen sharing while remote control is
-   * active, immediately stop relay control as well.
-   */
-  const setScreenShareActive = useCallback(
-    (active: boolean) => {
-      const previousState = stateRef.current;
+      console.log(
+        '[RemoteControl] Controller registered and control active'
+      );
 
       setState((prev) => ({
         ...prev,
-        screenShareActive: active,
+
+        status: 'active',
+
+        controlAllowed: true,
+
+        controllerRegistered: true,
+
+        controllerId:
+          prev.controllerId ||
+          currentUserId,
+
+        controllerRole:
+          prev.controllerRole ||
+          (currentUserRole as ControllerRole),
       }));
 
-      if (
-        active ||
-        !previousState.controlAllowed
-      ) {
-        return;
+      /**
+       * Update Supabase session to ACTIVE.
+       *
+       * Do not block UI if this DB update fails.
+       */
+      const databaseSessionId =
+        stateRef.current
+          .databaseSessionId;
+
+      if (databaseSessionId) {
+        void RemoteControlService
+          .startControl(
+            databaseSessionId
+          )
+          .catch((err) => {
+            console.warn(
+              '[RemoteControl] Could not mark Supabase session active:',
+              err
+            );
+          });
       }
 
-      const remoteSessionId =
-        previousState.remoteSessionId;
+      onControlGranted?.(
+        stateRef.current
+          .controllerName || '',
+        (stateRef.current
+          .controllerRole ||
+          currentUserRole) as ControllerRole
+      );
+    };
 
-      const socket = socketRef.current;
-
-      if (
-        remoteSessionId &&
-        socket?.isConnected()
-      ) {
-        socket.send({
-          type: 'CONTROL_STOP',
-          remoteSessionId,
-          reason: 'screen_share_stopped',
-        } as any);
-      }
+    /**
+     * ----------------------------------------------------------
+     * CONTROL_DENIED
+     * ----------------------------------------------------------
+     */
+    const handleControlDenied = (
+      event: RemoteControlEvent
+    ) => {
+      console.warn(
+        '[RemoteControl] Relay denied control:',
+        event.reason ||
+          'Unknown reason'
+      );
 
       setState((prev) => ({
         ...prev,
-        screenShareActive: false,
+
+        status: 'error',
+
         controlAllowed: false,
+
+        controllerRegistered: false,
+      }));
+    };
+
+    /**
+     * ----------------------------------------------------------
+     * INVALID_TOKEN
+     * ----------------------------------------------------------
+     */
+    const handleInvalidToken = (
+      event: RemoteControlEvent
+    ) => {
+      console.error(
+        '[RemoteControl] Relay rejected authorization token:',
+        event.reason ||
+          'Invalid token'
+      );
+
+      setState((prev) => ({
+        ...prev,
+
+        status: 'error',
+
+        controlAllowed: false,
+
+        controllerRegistered: false,
+      }));
+    };
+
+    /**
+     * ----------------------------------------------------------
+     * SESSION_EXPIRED
+     * ----------------------------------------------------------
+     */
+    const handleSessionExpired = (
+      event: RemoteControlEvent
+    ) => {
+      console.warn(
+        '[RemoteControl] Relay session expired:',
+        event.remoteSessionId
+      );
+
+      setState((prev) => ({
+        ...prev,
+
         status: 'ended',
+
+        controlAllowed: false,
+
+        controllerRegistered: false,
+        agentRegistered: false,
+
         controllerId: null,
         controllerName: null,
         controllerRole: null,
       }));
 
       onControlStopped?.();
-    },
-    [onControlStopped]
-  );
+
+      window.setTimeout(
+        resetActiveControl,
+        800
+      );
+    };
+
+    /**
+     * ----------------------------------------------------------
+     * CONTROL_STOPPED
+     * ----------------------------------------------------------
+     */
+    const handleControlStopped = (
+      event: RemoteControlEvent
+    ) => {
+      const expectedSession =
+        stateRef.current
+          .remoteSessionId;
+
+      if (
+        expectedSession &&
+        event.remoteSessionId &&
+        event.remoteSessionId !==
+          expectedSession
+      ) {
+        return;
+      }
+
+      console.log(
+        '[RemoteControl] Control stopped:',
+        event.reason ||
+          'stopped'
+      );
+
+      setState((prev) => ({
+        ...prev,
+
+        status: 'ended',
+
+        controlAllowed: false,
+
+        controllerRegistered: false,
+
+        controllerId: null,
+        controllerName: null,
+        controllerRole: null,
+      }));
+
+      onControlStopped?.();
+
+      window.setTimeout(
+        resetActiveControl,
+        800
+      );
+    };
+
+    try {
+      socket =
+        RemoteControlSocket
+          .getInstance();
+
+      socketRef.current =
+        socket;
+
+      socket.on(
+        'CONTROLLER_REGISTERED',
+        handleControllerRegistered
+      );
+
+      socket.on(
+        'CONTROL_DENIED',
+        handleControlDenied
+      );
+
+      socket.on(
+        'INVALID_TOKEN',
+        handleInvalidToken
+      );
+
+      socket.on(
+        'SESSION_EXPIRED',
+        handleSessionExpired
+      );
+
+      socket.on(
+        'CONTROL_STOPPED',
+        handleControlStopped
+      );
+
+      /**
+       * Establish initial connection.
+       */
+      socket
+        .connect()
+        .catch((err) => {
+          console.warn(
+            '[RemoteControl] Initial relay connection failed:',
+            err
+          );
+        });
+    } catch (err) {
+      console.error(
+        '[RemoteControl] Relay initialization failed:',
+        err
+      );
+    }
+
+    /**
+     * IMPORTANT:
+     *
+     * Do not disconnect the singleton socket here.
+     *
+     * Other call components may still use it.
+     *
+     * Only remove this hook's handlers.
+     */
+    return () => {
+      if (!socket) {
+        return;
+      }
+
+      socket.off(
+        'CONTROLLER_REGISTERED',
+        handleControllerRegistered
+      );
+
+      socket.off(
+        'CONTROL_DENIED',
+        handleControlDenied
+      );
+
+      socket.off(
+        'INVALID_TOKEN',
+        handleInvalidToken
+      );
+
+      socket.off(
+        'SESSION_EXPIRED',
+        handleSessionExpired
+      );
+
+      socket.off(
+        'CONTROL_STOPPED',
+        handleControlStopped
+      );
+    };
+  }, [
+    currentUserId,
+    currentUserRole,
+    onControlGranted,
+    onControlStopped,
+    resetActiveControl,
+  ]);
+
+  /**
+   * ------------------------------------------------------------
+   * HANDLE MEETING SIGNALING
+   * ------------------------------------------------------------
+   *
+   * These messages come from VideoSDK meeting signaling.
+   *
+   * They do NOT come directly from the Render WebSocket.
+   */
+  const handleSignalingEvent =
+    useCallback(
+      async (
+        event:
+          RemoteControlSignalingEvent
+      ) => {
+        try {
+          /**
+           * ----------------------------------------------------
+           * REQUEST_CONTROL
+           * ----------------------------------------------------
+           */
+          if (
+            event.type ===
+            'REQUEST_CONTROL'
+          ) {
+            if (
+              currentUserRole !==
+              'customer'
+            ) {
+              return;
+            }
+
+            /**
+             * Ignore request intended for another customer.
+             */
+            if (
+              event.customerId &&
+              event.customerId !==
+                currentUserId
+            ) {
+              return;
+            }
+
+            console.log(
+              '[RemoteControl] Customer received control request'
+            );
+
+            setState(
+              (prev) => ({
+                ...prev,
+
+                status:
+                  'requested',
+
+                customerId:
+                  event.customerId ||
+                  currentUserId,
+
+                requesterId:
+                  event.requesterId ||
+                  null,
+
+                requesterName:
+                  event.requesterName ||
+                  null,
+
+                requesterRole:
+                  event.requesterRole ||
+                  null,
+
+                /**
+                 * Correct distinction:
+                 */
+                databaseSessionId:
+                  event.databaseSessionId ||
+                  null,
+
+                remoteSessionId:
+                  event.remoteSessionId ||
+                  null,
+
+                controlAllowed:
+                  false,
+
+                controllerRegistered:
+                  false,
+
+                agentRegistered:
+                  false,
+              })
+            );
+
+            onRequestReceived?.(
+              event.requesterName ||
+                '',
+
+              event.requesterRole ||
+                'officer'
+            );
+
+            return;
+          }
+
+          /**
+           * ----------------------------------------------------
+           * CONTROL_GRANTED
+           * ----------------------------------------------------
+           *
+           * Customer approved.
+           *
+           * Officer/Advisor receives Controller token and
+           * registers with Render.
+           */
+          if (
+            event.type ===
+            'CONTROL_GRANTED'
+          ) {
+            if (
+              currentUserRole ===
+              'customer'
+            ) {
+              return;
+            }
+
+            /**
+             * Only intended controller handles it.
+             */
+            if (
+              event.controllerId &&
+              event.controllerId !==
+                currentUserId
+            ) {
+              return;
+            }
+
+            if (
+              !event.remoteSessionId
+            ) {
+              console.error(
+                '[RemoteControl] CONTROL_GRANTED missing remoteSessionId'
+              );
+
+              return;
+            }
+
+            if (
+              !event.controllerToken
+            ) {
+              console.error(
+                '[RemoteControl] CONTROL_GRANTED missing controllerToken'
+              );
+
+              setState(
+                (prev) => ({
+                  ...prev,
+                  status: 'error',
+                })
+              );
+
+              return;
+            }
+
+            const controllerRole =
+              event.controllerRole ||
+              (currentUserRole as ControllerRole);
+
+            setState(
+              (prev) => ({
+                ...prev,
+
+                status:
+                  'registering',
+
+                remoteSessionId:
+                  event.remoteSessionId!,
+
+                databaseSessionId:
+                  event.databaseSessionId ||
+                  prev.databaseSessionId,
+
+                controllerId:
+                  currentUserId,
+
+                controllerName:
+                  event.controllerName ||
+                  prev.controllerName,
+
+                controllerRole,
+
+                controlAllowed:
+                  false,
+
+                controllerRegistered:
+                  false,
+              })
+            );
+
+            /**
+             * Register controller with Render.
+             */
+            await registerControllerInternal(
+              event.remoteSessionId,
+              event.controllerToken,
+              currentUserId,
+              controllerRole
+            );
+
+            return;
+          }
+
+          /**
+           * ----------------------------------------------------
+           * CONTROL_REJECTED
+           * ----------------------------------------------------
+           */
+          if (
+            event.type ===
+            'CONTROL_REJECTED'
+          ) {
+            if (
+              currentUserRole ===
+              'customer'
+            ) {
+              return;
+            }
+
+            if (
+              event.requesterId &&
+              event.requesterId !==
+                currentUserId
+            ) {
+              return;
+            }
+
+            console.log(
+              '[RemoteControl] Customer rejected control request'
+            );
+
+            setState(
+              (prev) => ({
+                ...prev,
+
+                status:
+                  'rejected',
+
+                controlAllowed:
+                  false,
+
+                controllerRegistered:
+                  false,
+              })
+            );
+
+            window.setTimeout(
+              resetActiveControl,
+              1200
+            );
+
+            return;
+          }
+
+          /**
+           * ----------------------------------------------------
+           * CONTROL_STOPPED
+           * ----------------------------------------------------
+           */
+          if (
+            event.type ===
+            'CONTROL_STOPPED'
+          ) {
+            const expected =
+              stateRef.current
+                .remoteSessionId;
+
+            if (
+              expected &&
+              event.remoteSessionId &&
+              expected !==
+                event.remoteSessionId
+            ) {
+              return;
+            }
+
+            setState(
+              (prev) => ({
+                ...prev,
+
+                status:
+                  'ended',
+
+                controlAllowed:
+                  false,
+
+                controllerRegistered:
+                  false,
+
+                controllerId:
+                  null,
+
+                controllerName:
+                  null,
+
+                controllerRole:
+                  null,
+              })
+            );
+
+            onControlStopped?.();
+
+            window.setTimeout(
+              resetActiveControl,
+              800
+            );
+          }
+        } catch (err) {
+          console.error(
+            '[RemoteControl] Signaling handler failed:',
+            err
+          );
+        }
+      },
+      [
+        currentUserId,
+        currentUserRole,
+        onRequestReceived,
+        onControlStopped,
+        resetActiveControl,
+      ]
+    );
+
+  /**
+   * ------------------------------------------------------------
+   * INTERNAL CONTROLLER REGISTRATION
+   * ------------------------------------------------------------
+   */
+  const registerControllerInternal =
+    async (
+      remoteSessionId: string,
+
+      controllerToken: string,
+
+      controllerId: string,
+
+      controllerRole:
+        ControllerRole
+    ): Promise<void> => {
+      const socket =
+        socketRef.current;
+
+      if (!socket) {
+        throw new Error(
+          '[RemoteControl] Relay socket unavailable'
+        );
+      }
+
+      if (
+        !socket.isConnected()
+      ) {
+        await socket.connect();
+      }
+
+      const message:
+        ControllerRegisterRelayMessage =
+        {
+          type:
+            'CONTROLLER_REGISTER',
+
+          remoteSessionId,
+
+          meetingId,
+
+          controllerId,
+
+          controllerRole,
+
+          token:
+            controllerToken,
+        };
+
+      setState(
+        (prev) => ({
+          ...prev,
+
+          status:
+            'registering',
+
+          remoteSessionId,
+
+          controllerId,
+
+          controllerRole,
+
+          controlAllowed:
+            false,
+
+          controllerRegistered:
+            false,
+        })
+      );
+
+      socket.send(message);
+
+      console.log(
+        '[RemoteControl] CONTROLLER_REGISTER sent'
+      );
+    };
+
+  /**
+   * Public wrapper.
+   */
+  const registerControllerWithRelay =
+    useCallback(
+      async (
+        remoteSessionId: string,
+
+        controllerToken: string,
+
+        controllerId: string,
+
+        controllerRole:
+          ControllerRole
+      ) => {
+        await registerControllerInternal(
+          remoteSessionId,
+          controllerToken,
+          controllerId,
+          controllerRole
+        );
+      },
+      [meetingId]
+    );
+
+  /**
+   * ------------------------------------------------------------
+   * REQUEST CONTROL
+   * ------------------------------------------------------------
+   *
+   * Officer / Advisor:
+   *
+   * Take Control
+   *      ↓
+   * create Supabase row
+   */
+  const requestControl =
+    useCallback(
+      async (
+        requesterName: string
+      ) => {
+        if (
+          currentUserRole ===
+          'customer'
+        ) {
+          throw new Error(
+            'Customer cannot request control'
+          );
+        }
+
+        const customerId =
+          stateRef.current
+            .customerId;
+
+        if (!customerId) {
+          throw new Error(
+            'Customer ID is not available'
+          );
+        }
+
+        try {
+          setState(
+            (prev) => ({
+              ...prev,
+
+              status:
+                'requesting',
+            })
+          );
+
+          const requesterRole: ControllerRole =
+            currentUserRole;
+
+          const session =
+            await RemoteControlService
+              .createControlRequest(
+                meetingId,
+                customerId,
+                currentUserId,
+                requesterRole
+              );
+
+          /**
+           * IMPORTANT:
+           *
+           * session.id
+           *     =
+           * Supabase DB row.
+           *
+           * session.remote_session_id
+           *     =
+           * Render relay session.
+           */
+          setState(
+            (prev) => ({
+              ...prev,
+
+              status:
+                'requested',
+
+              requesterId:
+                currentUserId,
+
+              requesterName,
+
+              requesterRole,
+
+              databaseSessionId:
+                session.id,
+
+              remoteSessionId:
+                session
+                  .remote_session_id,
+
+              controlAllowed:
+                false,
+
+              controllerRegistered:
+                false,
+
+              agentRegistered:
+                false,
+            })
+          );
+
+          return session;
+        } catch (err) {
+          console.error(
+            '[RemoteControl] Request failed:',
+            err
+          );
+
+          setState(
+            (prev) => ({
+              ...prev,
+
+              status: 'idle',
+            })
+          );
+
+          throw err;
+        }
+      },
+      [
+        meetingId,
+        currentUserId,
+        currentUserRole,
+      ]
+    );
+
+  /**
+   * ------------------------------------------------------------
+   * CUSTOMER APPROVES CONTROL
+   * ------------------------------------------------------------
+   *
+   * Flow:
+   *
+   * Supabase approve
+   *      ↓
+   * Render /authorize
+   *      ↓
+   * agentToken + controllerToken
+   */
+  const approveControl =
+    useCallback(
+      async (
+        databaseSessionId?: string
+      ): Promise<
+        ApproveControlResult | undefined
+      > => {
+        if (
+          currentUserRole !==
+          'customer'
+        ) {
+          return;
+        }
+
+        const current =
+          stateRef.current;
+
+        const dbSessionId =
+          databaseSessionId ||
+          current.databaseSessionId;
+
+        if (!dbSessionId) {
+          throw new Error(
+            'Database session ID is unavailable'
+          );
+        }
+
+        if (
+          !current.requesterId
+        ) {
+          throw new Error(
+            'Requester ID is unavailable'
+          );
+        }
+
+        if (
+          !current.requesterRole
+        ) {
+          throw new Error(
+            'Requester role is unavailable'
+          );
+        }
+
+        const customerId =
+          current.customerId ||
+          currentUserId;
+
+        try {
+          setState(
+            (prev) => ({
+              ...prev,
+
+              status:
+                'approved',
+            })
+          );
+
+          /**
+           * 1. Approve Supabase request.
+           */
+          const session =
+            await RemoteControlService
+              .approveControlRequest(
+                dbSessionId,
+
+                current.requesterId
+              );
+
+          /**
+           * 2. Ask Render to issue secure short-lived tokens.
+           */
+          const authorization =
+            await RemoteControlService
+              .authorizeRemoteControl(
+                session
+                  .remote_session_id,
+
+                meetingId,
+
+                customerId,
+
+                current.requesterId,
+
+                current.requesterRole
+              );
+
+          setState(
+            (prev) => ({
+              ...prev,
+
+              status:
+                'approved',
+
+              customerId,
+
+              databaseSessionId:
+                session.id,
+
+              remoteSessionId:
+                session
+                  .remote_session_id,
+
+              controllerId:
+                current.requesterId,
+
+              controllerName:
+                current.requesterName,
+
+              controllerRole:
+                current.requesterRole,
+
+              controlAllowed:
+                false,
+
+              agentRegistered:
+                false,
+
+              controllerRegistered:
+                false,
+            })
+          );
+
+          console.log(
+            '[RemoteControl] Customer approved and Render authorization created'
+          );
+
+          /**
+           * IMPORTANT:
+           *
+           * VideoConsultationRoom must:
+           *
+           * 1. Send authorization.agentToken locally to Customer Agent.
+           * 2. Wait/allow Agent to register.
+           * 3. Send CONTROL_GRANTED to controller with controllerToken.
+           *
+           * Do not broadcast agentToken to other meeting participants.
+           */
+          return {
+            session,
+            authorization,
+          };
+        } catch (err) {
+          console.error(
+            '[RemoteControl] Approval failed:',
+            err
+          );
+
+          setState(
+            (prev) => ({
+              ...prev,
+
+              status:
+                'error',
+
+              controlAllowed:
+                false,
+            })
+          );
+
+          throw err;
+        }
+      },
+      [
+        currentUserId,
+        currentUserRole,
+        meetingId,
+      ]
+    );
+
+  /**
+   * ------------------------------------------------------------
+   * CUSTOMER REJECTS CONTROL
+   * ------------------------------------------------------------
+   */
+  const rejectControl =
+    useCallback(
+      async (
+        databaseSessionId?: string
+      ) => {
+        if (
+          currentUserRole !==
+          'customer'
+        ) {
+          return false;
+        }
+
+        const dbSessionId =
+          databaseSessionId ||
+          stateRef.current
+            .databaseSessionId;
+
+        if (!dbSessionId) {
+          console.warn(
+            '[RemoteControl] Cannot reject: missing database session ID'
+          );
+
+          return false;
+        }
+
+        try {
+          await RemoteControlService
+            .rejectControlRequest(
+              dbSessionId
+            );
+
+          setState(
+            (prev) => ({
+              ...prev,
+
+              status:
+                'rejected',
+
+              controlAllowed:
+                false,
+            })
+          );
+
+          return true;
+        } catch (err) {
+          console.error(
+            '[RemoteControl] Rejection failed:',
+            err
+          );
+
+          return false;
+        }
+      },
+      [currentUserRole]
+    );
+
+  /**
+   * ------------------------------------------------------------
+   * STOP / RELEASE CONTROL
+   * ------------------------------------------------------------
+   */
+  const stopControl =
+    useCallback(
+      async (
+        databaseSessionId?: string,
+
+        reason:
+          ControlStopRelayMessage['reason'] =
+          'stopped'
+      ) => {
+        const current =
+          stateRef.current;
+
+        const dbSessionId =
+          databaseSessionId ||
+          current.databaseSessionId;
+
+        /**
+         * Persist ended state in Supabase.
+         */
+        if (dbSessionId) {
+          try {
+            await RemoteControlService
+              .stopControl(
+                dbSessionId
+              );
+          } catch (err) {
+            console.warn(
+              '[RemoteControl] Supabase stop failed:',
+              err
+            );
+          }
+        }
+
+        /**
+         * Tell Render relay.
+         */
+        if (
+          current.remoteSessionId
+        ) {
+          const socket =
+            socketRef.current;
+
+          if (
+            socket?.isConnected()
+          ) {
+            const stopMessage:
+              ControlStopRelayMessage =
+              {
+                type:
+                  'CONTROL_STOP',
+
+                remoteSessionId:
+                  current.remoteSessionId,
+
+                reason,
+              };
+
+            socket.send(
+              stopMessage
+            );
+          }
+        }
+
+        setState(
+          (prev) => ({
+            ...prev,
+
+            status:
+              'ended',
+
+            controlAllowed:
+              false,
+
+            controllerRegistered:
+              false,
+
+            controllerId:
+              null,
+
+            controllerName:
+              null,
+
+            controllerRole:
+              null,
+          })
+        );
+
+        onControlStopped?.();
+
+        window.setTimeout(
+          resetActiveControl,
+          800
+        );
+      },
+      [
+        onControlStopped,
+        resetActiveControl,
+      ]
+    );
+
+  /**
+   * ------------------------------------------------------------
+   * SEND MOUSE / KEYBOARD EVENTS
+   * ------------------------------------------------------------
+   */
+  const sendControlEvent =
+    useCallback(
+      (
+        inputEvent:
+          RemoteControlEvent
+      ) => {
+        const current =
+          stateRef.current;
+
+        /**
+         * Never send input before Render confirmed control.
+         */
+        if (
+          current.status !==
+            'active' ||
+          !current.controlAllowed ||
+          !current
+            .controllerRegistered
+        ) {
+          return;
+        }
+
+        if (
+          !current.remoteSessionId
+        ) {
+          return;
+        }
+
+        const socket =
+          socketRef.current;
+
+        if (
+          !socket?.isConnected()
+        ) {
+          console.warn(
+            '[RemoteControl] Relay unavailable; input event dropped'
+          );
+
+          return;
+        }
+
+        const message:
+          ControlEventRelayMessage =
+          {
+            type:
+              'CONTROL_EVENT',
+
+            remoteSessionId:
+              current
+                .remoteSessionId,
+
+            event:
+              inputEvent,
+          };
+
+        socket.send(message);
+      },
+      []
+    );
+
+  /**
+   * ------------------------------------------------------------
+   * SET REAL CUSTOMER ID
+   * ------------------------------------------------------------
+   */
+  const setCustomerId =
+    useCallback(
+      (
+        customerId: string
+      ) => {
+        if (!customerId) {
+          return;
+        }
+
+        setState(
+          (prev) => {
+            if (
+              prev.customerId ===
+              customerId
+            ) {
+              return prev;
+            }
+
+            return {
+              ...prev,
+              customerId,
+            };
+          }
+        );
+      },
+      []
+    );
+
+  /**
+   * ------------------------------------------------------------
+   * MARK AGENT REGISTERED
+   * ------------------------------------------------------------
+   *
+   * VideoConsultationRoom / local Agent health logic can call
+   * this after Customer Agent confirms AGENT_REGISTERED.
+   */
+  const setAgentRegistered =
+    useCallback(
+      (
+        registered: boolean
+      ) => {
+        setState(
+          (prev) => ({
+            ...prev,
+
+            agentRegistered:
+              registered,
+          })
+        );
+      },
+      []
+    );
+
+  /**
+   * ------------------------------------------------------------
+   * SCREEN SHARE STATE
+   * ------------------------------------------------------------
+   *
+   * Stopping customer screen share immediately stops
+   * any active remote-control session.
+   */
+  const setScreenShareActive =
+    useCallback(
+      (
+        active: boolean
+      ) => {
+        const previous =
+          stateRef.current;
+
+        setState(
+          (prev) => ({
+            ...prev,
+
+            screenShareActive:
+              active,
+          })
+        );
+
+        if (active) {
+          return;
+        }
+
+        if (
+          !previous
+            .controlAllowed
+        ) {
+          return;
+        }
+
+        /**
+         * Fire and forget.
+         */
+        void stopControl(
+          previous
+            .databaseSessionId ||
+            undefined,
+
+          'screen_share_stopped'
+        );
+      },
+      [stopControl]
+    );
 
   return {
     state,
 
+    /**
+     * Meeting signaling receiver.
+     */
+    handleSignalingEvent,
+
+    /**
+     * Request lifecycle.
+     */
     requestControl,
     approveControl,
     rejectControl,
-    stopControl,
 
+    /**
+     * Relay registration.
+     */
     registerControllerWithRelay,
+
+    /**
+     * Active remote-control actions.
+     */
+    stopControl,
     sendControlEvent,
 
+    /**
+     * Shared meeting state.
+     */
     setCustomerId,
+    setAgentRegistered,
     setScreenShareActive,
-
-    handleSignalingEvent,
   };
 }

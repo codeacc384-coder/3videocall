@@ -1,79 +1,91 @@
-import crypto from 'crypto';
+import {
+  AuthenticationService,
+} from './authentication.js';
+
+import type {
+  ControllerRole,
+} from './types.js';
 
 /**
- * Token generation service for the website backend
- * This should be used by your existing backend to generate tokens
- * for Agent and Controller registration with the relay server
+ * RemoteControlTokenService
+ *
+ * Thin compatibility wrapper around AuthenticationService.
+ *
+ * IMPORTANT:
+ * All token signing must use the SAME:
+ *
+ * REMOTE_SESSION_SECRET
+ *
+ * as the relay AuthenticationService.
+ *
+ * Do not duplicate HMAC/token logic here.
  */
-
-export interface TokenPayload {
-  remoteSessionId: string;
-  meetingId: string;
-  userId: string;
-  role: 'agent' | 'controller';
-  controllerRole?: 'officer' | 'adviser';
-  iat: number;
-  exp: number;
-}
-
 export class RemoteControlTokenService {
-  private secret: string;
-  private tokenExpiryMs: number = 5 * 60 * 1000; // 5 minutes
+  private readonly authService:
+    AuthenticationService;
 
   constructor(secret?: string) {
-    this.secret = secret || process.env.REMOTE_SESSION_SECRET || 'dev-secret-change-in-production';
+    this.authService =
+      new AuthenticationService(secret);
   }
 
   /**
-   * Generate a token for Agent registration
-   * Call this when Customer approves screen sharing
+   * Generate Agent token.
+   *
+   * Used by Customer Electron Agent for:
+   *
+   * AGENT_REGISTER
    */
-  generateAgentToken(remoteSessionId: string, meetingId: string, customerId: string): string {
-    const payload: TokenPayload = {
-      remoteSessionId,
-      meetingId,
-      userId: customerId,
-      role: 'agent',
-      iat: Date.now(),
-      exp: Date.now() + this.tokenExpiryMs,
-    };
-
-    return this.signToken(payload);
+  generateAgentToken(
+    remoteSessionId: string,
+    meetingId: string,
+    customerId: string
+  ): string {
+    return this.authService
+      .generateAgentToken(
+        remoteSessionId,
+        meetingId,
+        customerId
+      );
   }
 
   /**
-   * Generate a token for Controller registration
-   * Call this when Customer approves control request
+   * Generate Controller token.
+   *
+   * Used by Officer / Advisor browser for:
+   *
+   * CONTROLLER_REGISTER
    */
   generateControllerToken(
     remoteSessionId: string,
     meetingId: string,
     controllerId: string,
-    controllerRole: 'officer' | 'adviser'
+    controllerRole: ControllerRole
   ): string {
-    const payload: TokenPayload = {
-      remoteSessionId,
-      meetingId,
-      userId: controllerId,
-      role: 'controller',
-      controllerRole,
-      iat: Date.now(),
-      exp: Date.now() + this.tokenExpiryMs,
-    };
-
-    return this.signToken(payload);
+    return this.authService
+      .generateControllerToken(
+        remoteSessionId,
+        meetingId,
+        controllerId,
+        controllerRole
+      );
   }
 
   /**
-   * Sign a token payload
+   * Optional verification helper.
+   *
+   * Useful for debugging/tests.
    */
-  private signToken(payload: TokenPayload): string {
-    const payloadStr = JSON.stringify(payload);
-    const signature = crypto
-      .createHmac('sha256', this.secret)
-      .update(payloadStr)
-      .digest('hex');
+  verifyToken(token: string) {
+    return this.authService
+      .verifyToken(token);
+  }
 
-    return `${Buffer.from(payloadStr).toString('base64')}.${signature}`;
+  /**
+   * Token lifetime in milliseconds.
+   */
+  getTokenExpiryMs(): number {
+    return this.authService
+      .getTokenExpiryMs();
   }
 }

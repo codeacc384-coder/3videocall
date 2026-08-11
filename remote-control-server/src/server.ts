@@ -2,133 +2,325 @@ import WebSocket, { WebSocketServer } from 'ws';
 import type { WebSocketServer as WSSType } from 'ws';
 import http from 'http';
 import url from 'url';
+
 import { SessionManager } from './sessionManager.js';
 import { AuthenticationService } from './authentication.js';
 import { MessageRouter } from './messageRouter.js';
 
+import type {
+  AuthorizeRemoteControlRequest,
+  AuthorizeRemoteControlResponse,
+  ControllerRole,
+} from './types.js';
+
 const PORT = parseInt(process.env.PORT || '8080', 10);
-const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || 'http://localhost:5173').split(',');
-const HEARTBEAT_INTERVAL = 30 * 1000; // 30 seconds
+
+const ALLOWED_ORIGINS = (
+  process.env.ALLOWED_ORIGINS ||
+  'http://localhost:5173'
+)
+  .split(',')
+  .map((origin) => origin.trim())
+  .filter(Boolean);
+
+const HEARTBEAT_INTERVAL = 30 * 1000;
 
 class RemoteControlServer {
   private httpServer: http.Server;
   private wss: WSSType;
+
   private sessionManager: SessionManager;
   private authService: AuthenticationService;
   private messageRouter: MessageRouter;
-  private clientHeartbeats: Map<WebSocket, NodeJS.Timeout> = new Map();
+
+  private clientHeartbeats:
+    Map<WebSocket, NodeJS.Timeout> =
+    new Map();
 
   constructor() {
-    this.httpServer = http.createServer(this.handleHttpRequest.bind(this));
-    this.sessionManager = new SessionManager();
-    this.authService = new AuthenticationService();
-    this.messageRouter = new MessageRouter(this.sessionManager, this.authService);
+    /**
+     * AuthenticationService intentionally throws if
+     * REMOTE_SESSION_SECRET is missing or too short.
+     */
+    this.authService =
+      new AuthenticationService();
 
-    this.wss = new WebSocketServer({ server: this.httpServer });
+    this.sessionManager =
+      new SessionManager();
+
+    this.messageRouter =
+      new MessageRouter(
+        this.sessionManager,
+        this.authService
+      );
+
+    this.httpServer =
+      http.createServer(
+        this.handleHttpRequest.bind(this)
+      );
+
+    /**
+     * WebSocket server shares the same Render HTTP server.
+     */
+    this.wss =
+      new WebSocketServer({
+        server: this.httpServer,
+        path: '/remote-control',
+      });
+
     this.setupWebSocketServer();
   }
 
   /**
-   * Setup WebSocket server
+   * ------------------------------------------------------------
+   * WEBSOCKET SERVER
+   * ------------------------------------------------------------
    */
   private setupWebSocketServer(): void {
-    this.wss.on('connection', (ws: WebSocket, req: http.IncomingMessage) => {
-      const clientIp = this.getClientIp(req);
-      console.log(`[Server] New WebSocket connection from ${clientIp}`);
+    this.wss.on(
+      'connection',
+      (
+        ws: WebSocket,
+        req: http.IncomingMessage
+      ) => {
+        const clientIp =
+          this.getClientIp(req);
 
-      // Validate origin
-      const origin = req.headers.origin || '';
-      if (!this.isOriginAllowed(origin)) {
-        console.warn(`[Server] Connection rejected: invalid origin ${origin}`);
-        ws.close(1008, 'Invalid origin');
-        return;
-      }
+        const origin =
+          req.headers.origin || '';
 
-      // Setup heartbeat
-      this.setupHeartbeat(ws);
+        console.log(
+          `[Server] WebSocket connection from ${clientIp}`
+        );
 
-      // Handle messages
-      ws.on('message', (data: WebSocket.Data) => {
-        try {
-          const message = data.toString();
-          // Determine if this is agent or controller based on message content
-          const isAgent = message.includes('\"type\":\"AGENT_REGISTER\"');
-          this.messageRouter.routeMessage(ws, message, isAgent);
-        } catch (err) {
-          console.error('[Server] Message handling error:', err);
+        /**
+         * Browser connections must come from an allowed origin.
+         *
+         * Electron/Node clients may not send Origin, so empty origin
+         * is allowed intentionally.
+         */
+        if (
+          !this.isOriginAllowed(origin)
+        ) {
+          console.warn(
+            `[Server] WebSocket rejected. Invalid origin: ${origin}`
+          );
+
+          try {
+            ws.close(
+              1008,
+              'Invalid origin'
+            );
+          } catch {
+            // Ignore close errors.
+          }
+
+          return;
         }
-      });
 
-      // Handle close
-      ws.on('close', () => {
-        console.log(`[Server] WebSocket closed from ${clientIp}`);
-        this.cleanupConnection(ws);
-      });
+        this.setupHeartbeat(ws);
 
-      // Handle error
-      ws.on('error', (err) => {
-        console.error(`[Server] WebSocket error from ${clientIp}:`, err);
-      });
-    });
+        /**
+         * Track whether this specific socket is an Agent.
+         *
+         * The previous implementation recalculated "isAgent"
+         * for every message by searching the JSON string.
+         *
+         * We keep the same router API for now but identify Agent
+         * based on the registration message.
+         */
+        let isAgentConnection = false;
 
-    console.log(`[Server] WebSocket server initialized on port ${PORT}`);
+        ws.on(
+          'message',
+          (data: WebSocket.RawData) => {
+            try {
+              const message =
+                data.toString();
+
+              /**
+               * If this socket sends AGENT_REGISTER,
+               * mark it as an Agent connection from now on.
+               */
+              try {
+                const parsed =
+                  JSON.parse(message);
+
+                if (
+                  parsed?.type ===
+                  'AGENT_REGISTER'
+                ) {
+                  isAgentConnection =
+                    true;
+                }
+              } catch {
+                /**
+                 * MessageRouter will handle malformed JSON.
+                 */
+              }
+
+              void this.messageRouter.routeMessage(
+                ws,
+                message,
+                isAgentConnection
+              );
+            } catch (err) {
+              console.error(
+                '[Server] Message handling error:',
+                err
+              );
+            }
+          }
+        );
+
+        ws.on('close', () => {
+          console.log(
+            `[Server] WebSocket closed from ${clientIp}`
+          );
+
+          this.cleanupConnection(ws);
+        });
+
+        ws.on('error', (err) => {
+          console.error(
+            `[Server] WebSocket error from ${clientIp}:`,
+            err
+          );
+        });
+      }
+    );
+
+    console.log(
+      `[Server] WebSocket endpoint initialized: /remote-control`
+    );
   }
 
   /**
-   * Setup heartbeat for connection
+   * ------------------------------------------------------------
+   * WEBSOCKET HEARTBEAT
+   * ------------------------------------------------------------
    */
-  private setupHeartbeat(ws: WebSocket): void {
-    const heartbeat = setInterval(() => {
-      if (ws.readyState === WebSocket.OPEN) {
-        ws.ping();
-      } else {
-        clearInterval(heartbeat);
-        this.clientHeartbeats.delete(ws);
-      }
-    }, HEARTBEAT_INTERVAL);
+  private setupHeartbeat(
+    ws: WebSocket
+  ): void {
+    const heartbeat =
+      setInterval(() => {
+        if (
+          ws.readyState ===
+          WebSocket.OPEN
+        ) {
+          try {
+            ws.ping();
+          } catch {
+            clearInterval(heartbeat);
 
-    this.clientHeartbeats.set(ws, heartbeat);
+            this.clientHeartbeats.delete(
+              ws
+            );
+          }
+        } else {
+          clearInterval(heartbeat);
+
+          this.clientHeartbeats.delete(
+            ws
+          );
+        }
+      }, HEARTBEAT_INTERVAL);
+
+    this.clientHeartbeats.set(
+      ws,
+      heartbeat
+    );
 
     ws.on('pong', () => {
-      // Connection is alive
+      /**
+       * Transport is alive.
+       */
     });
   }
 
   /**
-   * Cleanup connection
+   * ------------------------------------------------------------
+   * CLEANUP SOCKET
+   * ------------------------------------------------------------
    */
-  private cleanupConnection(ws: WebSocket): void {
-    // Clear heartbeat
-    const heartbeat = this.clientHeartbeats.get(ws);
+  private cleanupConnection(
+    ws: WebSocket
+  ): void {
+    const heartbeat =
+      this.clientHeartbeats.get(ws);
+
     if (heartbeat) {
       clearInterval(heartbeat);
+
       this.clientHeartbeats.delete(ws);
     }
 
-    // Find and cleanup session
-    for (const [remoteSessionId, session] of (this.sessionManager as any).sessions.entries()) {
-      if (session.agentSocket === ws) {
-        this.sessionManager.unregisterAgent(remoteSessionId);
-        // Notify controller
-        if (session.controllerSocket && session.controllerSocket.readyState === WebSocket.OPEN) {
-          session.controllerSocket.send(
-            JSON.stringify({
+    /**
+     * SessionManager now exposes getSessions(),
+     * so we no longer access its private Map through "as any".
+     */
+    for (
+      const [
+        remoteSessionId,
+        session,
+      ] of this.sessionManager
+        .getSessions()
+        .entries()
+    ) {
+      if (
+        session.agentSocket === ws
+      ) {
+        const controllerSocket =
+          session.controllerSocket;
+
+        this.sessionManager.unregisterAgent(
+          remoteSessionId
+        );
+
+        if (
+          controllerSocket &&
+          controllerSocket.readyState ===
+            WebSocket.OPEN
+        ) {
+          this.safeSend(
+            controllerSocket,
+            {
               type: 'CONTROL_STOPPED',
-              reason: 'agent_disconnected',
+              reason:
+                'agent_disconnected',
               remoteSessionId,
-            })
+            }
           );
         }
-      } else if (session.controllerSocket === ws) {
-        this.sessionManager.unregisterController(remoteSessionId);
-        // Notify agent
-        if (session.agentSocket && session.agentSocket.readyState === WebSocket.OPEN) {
-          session.agentSocket.send(
-            JSON.stringify({
+
+        continue;
+      }
+
+      if (
+        session.controllerSocket ===
+        ws
+      ) {
+        const agentSocket =
+          session.agentSocket;
+
+        this.sessionManager.unregisterController(
+          remoteSessionId
+        );
+
+        if (
+          agentSocket &&
+          agentSocket.readyState ===
+            WebSocket.OPEN
+        ) {
+          this.safeSend(
+            agentSocket,
+            {
               type: 'CONTROL_STOPPED',
-              reason: 'controller_disconnected',
+              reason:
+                'controller_disconnected',
               remoteSessionId,
-            })
+            }
           );
         }
       }
@@ -136,105 +328,663 @@ class RemoteControlServer {
   }
 
   /**
-   * Handle HTTP requests (health check, metrics)
+   * ------------------------------------------------------------
+   * HTTP ROUTER
+   * ------------------------------------------------------------
    */
-  private handleHttpRequest(req: http.IncomingMessage, res: http.ServerResponse): void {
-    const parsedUrl = url.parse(req.url || '', true);
-    const pathname = parsedUrl.pathname;
+  private async handleHttpRequest(
+    req: http.IncomingMessage,
+    res: http.ServerResponse
+  ): Promise<void> {
+    const parsedUrl =
+      url.parse(req.url || '', true);
 
-    if (pathname === '/') {
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(
-        JSON.stringify({
+    const pathname =
+      parsedUrl.pathname || '/';
+
+    /**
+     * CORS headers for browser HTTP requests.
+     */
+    this.applyCorsHeaders(
+      req,
+      res
+    );
+
+    if (
+      req.method === 'OPTIONS'
+    ) {
+      res.writeHead(204);
+      res.end();
+      return;
+    }
+
+    /**
+     * Health landing route.
+     */
+    if (
+      req.method === 'GET' &&
+      pathname === '/'
+    ) {
+      this.sendJson(
+        res,
+        200,
+        {
           status: 'ok',
-          service: 'InsuranceOne Remote Control Relay',
-          websocket: '/remote-control',
-        })
+          service:
+            'InsuranceOne Remote Control Relay',
+          websocket:
+            '/remote-control',
+          authorize:
+            '/remote-control/authorize',
+        }
       );
-    } else if (pathname === '/health') {
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(
-        JSON.stringify({
+
+      return;
+    }
+
+    /**
+     * Health endpoint.
+     */
+    if (
+      req.method === 'GET' &&
+      pathname === '/health'
+    ) {
+      this.sendJson(
+        res,
+        200,
+        {
           status: 'ok',
-          timestamp: new Date().toISOString(),
-          sessions: this.sessionManager.getSessionCount(),
-          activeControl: this.sessionManager.getActiveControlCount(),
-        })
+          timestamp:
+            new Date().toISOString(),
+          sessions:
+            this.sessionManager
+              .getSessionCount(),
+          activeControl:
+            this.sessionManager
+              .getActiveControlCount(),
+        }
       );
-    } else if (pathname === '/metrics') {
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(
-        JSON.stringify({
-          sessions: this.sessionManager.getSessionCount(),
-          activeControl: this.sessionManager.getActiveControlCount(),
-          connections: this.wss.clients.size,
-        })
+
+      return;
+    }
+
+    /**
+     * Metrics endpoint.
+     */
+    if (
+      req.method === 'GET' &&
+      pathname === '/metrics'
+    ) {
+      this.sendJson(
+        res,
+        200,
+        {
+          sessions:
+            this.sessionManager
+              .getSessionCount(),
+
+          activeControl:
+            this.sessionManager
+              .getActiveControlCount(),
+
+          connections:
+            this.wss.clients.size,
+        }
       );
-    } else {
-      res.writeHead(404);
-      res.end('Not Found');
+
+      return;
+    }
+
+    /**
+     * ----------------------------------------------------------
+     * REMOTE CONTROL AUTHORIZATION
+     * ----------------------------------------------------------
+     *
+     * Customer calls this AFTER clicking Accept Control.
+     *
+     * Render generates:
+     *
+     * agentToken
+     * controllerToken
+     *
+     * REMOTE_SESSION_SECRET never leaves Render.
+     */
+    if (
+      req.method === 'POST' &&
+      pathname ===
+        '/remote-control/authorize'
+    ) {
+      await this.handleAuthorizeRequest(
+        req,
+        res
+      );
+
+      return;
+    }
+
+    this.sendJson(
+      res,
+      404,
+      {
+        error: 'NOT_FOUND',
+      }
+    );
+  }
+
+  /**
+   * ------------------------------------------------------------
+   * AUTHORIZE REMOTE CONTROL
+   * ------------------------------------------------------------
+   */
+  private async handleAuthorizeRequest(
+    req: http.IncomingMessage,
+    res: http.ServerResponse
+  ): Promise<void> {
+    try {
+      /**
+       * Only allow browser calls from configured frontend.
+       */
+      const origin =
+        req.headers.origin || '';
+
+      if (
+        origin &&
+        !this.isOriginAllowed(origin)
+      ) {
+        this.sendJson(
+          res,
+          403,
+          {
+            error:
+              'ORIGIN_NOT_ALLOWED',
+          }
+        );
+
+        return;
+      }
+
+      const body =
+        await this.readJsonBody<
+          AuthorizeRemoteControlRequest
+        >(req);
+
+      if (!body) {
+        this.sendJson(
+          res,
+          400,
+          {
+            error:
+              'INVALID_REQUEST',
+            message:
+              'Missing JSON request body',
+          }
+        );
+
+        return;
+      }
+
+      const {
+        remoteSessionId,
+        meetingId,
+        customerId,
+        controllerId,
+        controllerRole,
+      } = body;
+
+      if (
+        !remoteSessionId ||
+        !meetingId ||
+        !customerId ||
+        !controllerId ||
+        !controllerRole
+      ) {
+        this.sendJson(
+          res,
+          400,
+          {
+            error:
+              'INVALID_REQUEST',
+            message:
+              'remoteSessionId, meetingId, customerId, controllerId and controllerRole are required',
+          }
+        );
+
+        return;
+      }
+
+      if (
+        !this.isControllerRole(
+          controllerRole
+        )
+      ) {
+        this.sendJson(
+          res,
+          400,
+          {
+            error:
+              'INVALID_CONTROLLER_ROLE',
+            message:
+              'controllerRole must be officer or advisor',
+          }
+        );
+
+        return;
+      }
+
+      /**
+       * Generate signed short-lived Agent token.
+       */
+      const agentToken =
+        this.authService
+          .generateAgentToken(
+            remoteSessionId,
+            meetingId,
+            customerId
+          );
+
+      /**
+       * Generate signed short-lived Controller token.
+       */
+      const controllerToken =
+        this.authService
+          .generateControllerToken(
+            remoteSessionId,
+            meetingId,
+            controllerId,
+            controllerRole
+          );
+
+      const response:
+        AuthorizeRemoteControlResponse =
+        {
+          remoteSessionId,
+
+          agentToken,
+          controllerToken,
+
+          expiresInMs:
+            this.authService
+              .getTokenExpiryMs(),
+        };
+
+      /**
+       * IMPORTANT:
+       *
+       * Never log actual tokens.
+       */
+      console.log(
+        `[Server] Remote control authorized: session=${remoteSessionId}, controller=${controllerId}, role=${controllerRole}`
+      );
+
+      this.sendJson(
+        res,
+        200,
+        response
+      );
+    } catch (err) {
+      console.error(
+        '[Server] Authorization endpoint failed:',
+        err
+      );
+
+      this.sendJson(
+        res,
+        500,
+        {
+          error:
+            'AUTHORIZATION_FAILED',
+        }
+      );
     }
   }
 
   /**
-   * Validate origin
+   * ------------------------------------------------------------
+   * JSON BODY READER
+   * ------------------------------------------------------------
    */
-  private isOriginAllowed(origin: string): boolean {
-    if (!origin) return true; // Allow requests without origin (e.g., from Electron)
+  private readJsonBody<T>(
+    req: http.IncomingMessage
+  ): Promise<T | null> {
+    return new Promise(
+      (resolve, reject) => {
+        const chunks: Buffer[] = [];
 
-    return ALLOWED_ORIGINS.some((allowed) => {
-      const allowedTrimmed = allowed.trim();
-      return origin === allowedTrimmed || origin.startsWith(allowedTrimmed);
-    });
+        let size = 0;
+
+        /**
+         * Authorization body should be tiny.
+         * Limit to 32KB.
+         */
+        const MAX_BODY_SIZE =
+          32 * 1024;
+
+        req.on(
+          'data',
+          (chunk: Buffer) => {
+            size += chunk.length;
+
+            if (
+              size >
+              MAX_BODY_SIZE
+            ) {
+              reject(
+                new Error(
+                  'Request body too large'
+                )
+              );
+
+              req.destroy();
+
+              return;
+            }
+
+            chunks.push(chunk);
+          }
+        );
+
+        req.on('end', () => {
+          try {
+            const raw =
+              Buffer.concat(
+                chunks
+              ).toString('utf8');
+
+            if (!raw) {
+              resolve(null);
+
+              return;
+            }
+
+            resolve(
+              JSON.parse(raw) as T
+            );
+          } catch (err) {
+            reject(err);
+          }
+        });
+
+        req.on(
+          'error',
+          reject
+        );
+      }
+    );
   }
 
   /**
-   * Get client IP
+   * ------------------------------------------------------------
+   * CORS
+   * ------------------------------------------------------------
    */
-  private getClientIp(req: http.IncomingMessage): string {
+  private applyCorsHeaders(
+    req: http.IncomingMessage,
+    res: http.ServerResponse
+  ): void {
+    const origin =
+      req.headers.origin || '';
+
+    if (
+      origin &&
+      this.isOriginAllowed(origin)
+    ) {
+      res.setHeader(
+        'Access-Control-Allow-Origin',
+        origin
+      );
+
+      res.setHeader(
+        'Vary',
+        'Origin'
+      );
+    }
+
+    res.setHeader(
+      'Access-Control-Allow-Methods',
+      'GET,POST,OPTIONS'
+    );
+
+    res.setHeader(
+      'Access-Control-Allow-Headers',
+      'Content-Type,Authorization'
+    );
+
+    res.setHeader(
+      'Access-Control-Max-Age',
+      '86400'
+    );
+  }
+
+  /**
+   * ------------------------------------------------------------
+   * ORIGIN VALIDATION
+   * ------------------------------------------------------------
+   */
+  private isOriginAllowed(
+    origin: string
+  ): boolean {
+    /**
+     * Electron / Node clients generally do not send Origin.
+     */
+    if (!origin) {
+      return true;
+    }
+
+    return ALLOWED_ORIGINS.includes(
+      origin
+    );
+  }
+
+  /**
+   * ------------------------------------------------------------
+   * ROLE VALIDATION
+   * ------------------------------------------------------------
+   */
+  private isControllerRole(
+    role: unknown
+  ): role is ControllerRole {
     return (
-      (req.headers['x-forwarded-for'] as string)?.split(',')[0] ||
-      req.socket.remoteAddress ||
+      role === 'officer' ||
+      role === 'advisor'
+    );
+  }
+
+  /**
+   * ------------------------------------------------------------
+   * JSON RESPONSE
+   * ------------------------------------------------------------
+   */
+  private sendJson(
+    res: http.ServerResponse,
+    statusCode: number,
+    data: unknown
+  ): void {
+    res.writeHead(
+      statusCode,
+      {
+        'Content-Type':
+          'application/json; charset=utf-8',
+
+        'Cache-Control':
+          'no-store',
+      }
+    );
+
+    res.end(
+      JSON.stringify(data)
+    );
+  }
+
+  /**
+   * ------------------------------------------------------------
+   * SAFE WEBSOCKET SEND
+   * ------------------------------------------------------------
+   */
+  private safeSend(
+    ws: WebSocket,
+    message: object
+  ): void {
+    if (
+      ws.readyState !==
+      WebSocket.OPEN
+    ) {
+      return;
+    }
+
+    try {
+      ws.send(
+        JSON.stringify(message)
+      );
+    } catch (err) {
+      console.error(
+        '[Server] Failed to send WebSocket message:',
+        err
+      );
+    }
+  }
+
+  /**
+   * ------------------------------------------------------------
+   * CLIENT IP
+   * ------------------------------------------------------------
+   */
+  private getClientIp(
+    req: http.IncomingMessage
+  ): string {
+    const forwarded =
+      req.headers[
+        'x-forwarded-for'
+      ];
+
+    if (
+      typeof forwarded ===
+      'string'
+    ) {
+      return (
+        forwarded
+          .split(',')[0]
+          ?.trim() ||
+        'unknown'
+      );
+    }
+
+    return (
+      req.socket
+        .remoteAddress ||
       'unknown'
     );
   }
 
   /**
-   * Start server
+   * ------------------------------------------------------------
+   * START
+   * ------------------------------------------------------------
    */
   start(): void {
-    const bindAddress = process.env.HOST || '0.0.0.0';
-    this.httpServer.listen(PORT, bindAddress, () => {
-      console.log(`[Server] Remote Control Relay Server listening on ${bindAddress}:${PORT}`);
-      console.log(`[Server] WebSocket endpoint: ws://${bindAddress}:${PORT}/remote-control`);
-      console.log(`[Server] Allowed origins: ${ALLOWED_ORIGINS.join(', ')}`);
-      console.log(`[Server] Environment: ${process.env.NODE_ENV || 'development'}`);
-    });
+    const bindAddress =
+      process.env.HOST ||
+      '0.0.0.0';
+
+    this.httpServer.listen(
+      PORT,
+      bindAddress,
+      () => {
+        console.log(
+          `[Server] Remote Control Relay listening on ${bindAddress}:${PORT}`
+        );
+
+        console.log(
+          '[Server] WebSocket endpoint: /remote-control'
+        );
+
+        console.log(
+          '[Server] Authorization endpoint: POST /remote-control/authorize'
+        );
+
+        console.log(
+          `[Server] Allowed origins: ${ALLOWED_ORIGINS.join(', ')}`
+        );
+
+        console.log(
+          `[Server] Environment: ${
+            process.env.NODE_ENV ||
+            'development'
+          }`
+        );
+      }
+    );
   }
 
   /**
-   * Stop server
+   * ------------------------------------------------------------
+   * STOP
+   * ------------------------------------------------------------
    */
   stop(): void {
-    console.log('[Server] Shutting down...');
-    this.wss.close();
+    console.log(
+      '[Server] Shutting down...'
+    );
+
+    for (
+      const heartbeat of
+      this.clientHeartbeats.values()
+    ) {
+      clearInterval(
+        heartbeat
+      );
+    }
+
+    this.clientHeartbeats.clear();
+
+    this.sessionManager.destroy();
+
+    try {
+      this.wss.close();
+    } catch {
+      // Ignore shutdown error.
+    }
+
     this.httpServer.close();
   }
 }
 
-// Start server
-const server = new RemoteControlServer();
+/**
+ * --------------------------------------------------------------
+ * START SERVER
+ * --------------------------------------------------------------
+ */
+const server =
+  new RemoteControlServer();
+
 server.start();
 
-// Graceful shutdown
-process.on('SIGTERM', () => {
-  console.log('[Server] SIGTERM received, shutting down gracefully');
-  server.stop();
-  process.exit(0);
-});
+/**
+ * --------------------------------------------------------------
+ * GRACEFUL SHUTDOWN
+ * --------------------------------------------------------------
+ */
+process.on(
+  'SIGTERM',
+  () => {
+    console.log(
+      '[Server] SIGTERM received'
+    );
 
-process.on('SIGINT', () => {
-  console.log('[Server] SIGINT received, shutting down gracefully');
-  server.stop();
-  process.exit(0);
-});
+    server.stop();
+
+    process.exit(0);
+  }
+);
+
+process.on(
+  'SIGINT',
+  () => {
+    console.log(
+      '[Server] SIGINT received'
+    );
+
+    server.stop();
+
+    process.exit(0);
+  }
+);
