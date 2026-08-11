@@ -1,7 +1,5 @@
-import WebSocket from 'ws';
-import * as ws from 'ws';
-// Ensure we get the runtime Server constructor from the `ws` package
-const WebSocketServer: any = (ws as any).Server ?? (ws as any).WebSocketServer;
+import WebSocket, { WebSocketServer } from 'ws';
+import type { WebSocketServer as WSSType } from 'ws';
 import http from 'http';
 import url from 'url';
 import { SessionManager } from './sessionManager.js';
@@ -14,7 +12,7 @@ const HEARTBEAT_INTERVAL = 30 * 1000; // 30 seconds
 
 class RemoteControlServer {
   private httpServer: http.Server;
-  private wss: WebSocketServer;
+  private wss: WSSType;
   private sessionManager: SessionManager;
   private authService: AuthenticationService;
   private messageRouter: MessageRouter;
