@@ -1,6 +1,6 @@
 import WebSocket from 'ws';
-import { SessionManager } from './sessionManager';
-import { AuthenticationService } from './authentication';
+import { SessionManager } from './sessionManager.js';
+import { AuthenticationService } from './authentication.js';
 import {
   IncomingMessage,
   ControlEventMessage,
@@ -8,7 +8,7 @@ import {
   ControllerRegisterMessage,
   ControlStopMessage,
   ServerMessage,
-} from './types';
+} from './types.js';
 
 export class MessageRouter {
   constructor(

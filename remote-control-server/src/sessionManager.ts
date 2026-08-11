@@ -1,5 +1,5 @@
 import WebSocket from 'ws';
-import { ActiveRemoteSession, ControllerRole } from './types';
+import { ActiveRemoteSession, ControllerRole } from './types.js';
 
 export class SessionManager {
   private sessions: Map<string, ActiveRemoteSession> = new Map();

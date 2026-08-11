@@ -1,9 +1,12 @@
-import WebSocket, { Server as WebSocketServer } from 'ws';
+import WebSocket from 'ws';
+import * as ws from 'ws';
+// Ensure we get the runtime Server constructor from the `ws` package
+const WebSocketServer: any = (ws as any).Server ?? (ws as any).WebSocketServer;
 import http from 'http';
 import url from 'url';
-import { SessionManager } from './sessionManager';
-import { AuthenticationService } from './authentication';
-import { MessageRouter } from './messageRouter';
+import { SessionManager } from './sessionManager.js';
+import { AuthenticationService } from './authentication.js';
+import { MessageRouter } from './messageRouter.js';
 
 const PORT = parseInt(process.env.PORT || '8080', 10);
 const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || 'http://localhost:5173').split(',');
@@ -193,9 +196,10 @@ class RemoteControlServer {
    * Start server
    */
   start(): void {
-    this.httpServer.listen(PORT, () => {
-      console.log(`[Server] Remote Control Relay Server listening on port ${PORT}`);
-      console.log(`[Server] WebSocket endpoint: ws://localhost:${PORT}/remote-control`);
+    const bindAddress = process.env.HOST || '0.0.0.0';
+    this.httpServer.listen(PORT, bindAddress, () => {
+      console.log(`[Server] Remote Control Relay Server listening on ${bindAddress}:${PORT}`);
+      console.log(`[Server] WebSocket endpoint: ws://${bindAddress}:${PORT}/remote-control`);
       console.log(`[Server] Allowed origins: ${ALLOWED_ORIGINS.join(', ')}`);
       console.log(`[Server] Environment: ${process.env.NODE_ENV || 'development'}`);
     });
