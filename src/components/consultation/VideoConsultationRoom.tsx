@@ -115,9 +115,19 @@ const MeetingRoom: React.FC<{
   currentUserRole: PortalRole;
   onClose: () => void;
 }> = ({ roomId, title, currentUserId, currentUserName, currentUserRole, onClose }) => {
+  // PubSub/data handler ref — assigned below so onData can call into it synchronously
+  const pubsubHandlerRef = useRef<(data: { from: string; timestamp: string; payload: string | Uint8Array }) => void>(() => {});
+
   const meetingApi = useMeeting({
     onMeetingJoined: () => setJoined(true),
     onMeetingLeft: () => { setJoined(false); onClose(); },
+    onData: (d: any) => {
+      try {
+        pubsubHandlerRef.current(d);
+      } catch (err) {
+        console.error('[PubSub] onData handler error', err);
+      }
+    }
   }) as any;
   const { join, leave, toggleMic, toggleWebcam, participants, localMicOn, localWebcamOn, localParticipant, enableScreenShare, disableScreenShare } = meetingApi as any;
 
@@ -156,13 +166,8 @@ const MeetingRoom: React.FC<{
     } catch (err) { console.error('[PubSub] publish failed', err); }
   };
 
-  const subscribeSignal = (handler: (msg: any) => void) => {
-    try {
-      if (meetingApi?.on) { meetingApi.on(REMOTE_CONTROL_TOPIC, handler); return () => meetingApi.off?.(REMOTE_CONTROL_TOPIC, handler); }
-      if (meetingApi?.meeting?.on) { meetingApi.meeting.on(REMOTE_CONTROL_TOPIC, handler); return () => meetingApi.meeting.off?.(REMOTE_CONTROL_TOPIC, handler); }
-      if (meetingApi?.pubSub?.on) { meetingApi.pubSub.on(REMOTE_CONTROL_TOPIC, handler); return () => meetingApi.pubSub.off?.(REMOTE_CONTROL_TOPIC, handler); }
-      console.warn('[PubSub] subscribe not available on meetingApi');
-    } catch (err) { console.error('[PubSub] subscribe failed', err); }
+  // subscribeSignal is intentionally a no-op — we use useMeeting's onData instead
+  const subscribeSignal = (_handler: (msg: any) => void) => {
     return () => {};
   };
 
@@ -201,6 +206,30 @@ const MeetingRoom: React.FC<{
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [participants.size]);
 
+  // Presenter view: top-level component to render the current presenter (screen sharer)
+  const PresenterScreenView: React.FC<{ presenterId: string | null }> = ({ presenterId }) => {
+    if (!presenterId) return null;
+    // useParticipant must be called at top level of component
+    const participant = useParticipant(presenterId) as any;
+    const screenShareOn = participant?.screenShareOn;
+    const screenShareStream = participant?.screenShareStream;
+
+    const mediaStream = (screenShareOn && screenShareStream && screenShareStream.track)
+      ? new MediaStream([screenShareStream.track])
+      : null;
+
+    return (
+      <SharedScreenView
+        screenStream={mediaStream}
+        isControlActive={remoteControl.state.controlAllowed}
+        meetingId={roomId}
+        customerId={customerUserId || ''}
+        controllerId={remoteControl.state.controllerId || ''}
+        onSendEvent={(e) => remoteControl.sendControlEvent(e as any)}
+      />
+    );
+  };
+
   // Fetch existing chat messages
   const fetchMessages = async () => {
     const { data } = await supabase
@@ -209,70 +238,6 @@ const MeetingRoom: React.FC<{
       .eq('room_id', roomId)
       .order('created_at', { ascending: true });
     if (data) setMessages(data as ChatMessage[]);
-  };
-
-  // Fetch existing forms
-  const fetchForms = async () => {
-    const { data } = await supabase
-      .from('consultation_forms')
-      .select('*')
-      .eq('room_id', roomId)
-      .order('created_at', { ascending: true });
-    if (data) setForms(data as SharedForm[]);
-  };
-
-  useEffect(() => {
-    if (!joined) return;
-    // Do NOT set customerId to the current user for all roles.
-    // Find the real customer participant and map application user id.
-    // We'll set remoteControl customerId once we detect the customer participant below.
-    fetchMessages();
-    fetchForms();
-
-    // Realtime chat subscription
-    const chatChannel = supabase
-      .channel(`chat-${roomId}`)
-      .on('postgres_changes', {
-        event: 'INSERT', schema: 'public', table: 'consultation_messages',
-        filter: `room_id=eq.${roomId}`
-      }, (payload) => {
-        setMessages(prev => [...prev, payload.new as ChatMessage]);
-      })
-      .subscribe();
-
-    // Realtime forms subscription
-    const formsChannel = supabase
-      .channel(`forms-${roomId}`)
-      .on('postgres_changes', {
-        event: 'INSERT', schema: 'public', table: 'consultation_forms',
-        filter: `room_id=eq.${roomId}`
-      }, (payload) => {
-        setForms(prev => [...prev, payload.new as SharedForm]);
-      })
-      .subscribe();
-
-    return () => {
-      supabase.removeChannel(chatChannel);
-      supabase.removeChannel(formsChannel);
-    };
-  }, [joined, roomId]);
-
-  // Auto-scroll chat
-  useEffect(() => {
-    chatEndRef.current?.scrollIntoView({ behavior: 'smooth' });
-  }, [messages]);
-
-  const handleSendMessage = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!inputMessage.trim()) return;
-    await supabase.from('consultation_messages').insert({
-      room_id: roomId,
-      sender_id: currentUserId,
-      sender_name: currentUserName,
-      sender_role: currentUserRole,
-      text: inputMessage.trim(),
-    });
-    setInputMessage('');
   };
 
   const handleSubmitForm = async (e: React.FormEvent) => {
@@ -299,49 +264,7 @@ const MeetingRoom: React.FC<{
     URL.revokeObjectURL(url);
   };
 
-  // Subscribe to VideoSDK PubSub REMOTE_CONTROL_SIGNAL messages and feed into hook
-  useEffect(() => {
-    if (!joined) return;
-    const handler = async (raw: any) => {
-      const msg = typeof raw === 'string' ? JSON.parse(raw) : raw;
-      // Feed into hook state machine
-      remoteControl.handleSignalingEvent(msg);
-
-      // If this client is the controller and got CONTROL_GRANTED, register with relay
-      if (msg.type === 'CONTROL_GRANTED' && currentUserRole !== 'customer') {
-        if (msg.controllerId === currentUserId) {
-          const token = msg.controllerToken || (msg as any).controllerToken;
-          if (token) {
-            try {
-              await remoteControl.registerControllerWithRelay(msg.remoteSessionId, token, currentUserId, currentUserRole as any);
-            } catch (err) {
-              console.error('Controller register failed', err);
-            }
-          } else {
-            console.warn('No controller token provided in CONTROL_GRANTED payload');
-          }
-        }
-      }
-
-      // If this client is the customer and CONTROL_GRANTED published, instruct local agent to AGENT_REGISTER
-      if (msg.type === 'CONTROL_GRANTED' && currentUserRole === 'customer') {
-        const agentToken = msg.agentToken || (msg as any).agentToken;
-        const remoteSessionId = msg.remoteSessionId;
-        if ((window as any).agentAPI?.registerWithRelay && agentToken) {
-          try {
-            await (window as any).agentAPI.registerWithRelay({ remoteSessionId, token: agentToken, meetingId: roomId, customerId: currentUserId });
-            console.log('[Agent] registerWithRelay invoked');
-          } catch (err) {
-            console.error('Agent register failed', err);
-          }
-        }
-      }
-    };
-
-    const unsub = subscribeSignal(handler as any);
-    return () => { unsub?.(); };
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [joined]);
+  
 
   const handleToggleScreenShare = async () => {
     if (isScreenSharing) {
@@ -539,26 +462,12 @@ const MeetingRoom: React.FC<{
         <div className="flex-1 flex flex-col p-4 gap-4 overflow-hidden">
           {/* If any participant is screen-sharing, render the shared screen as the main view */}
           {(() => {
-            const screenOwner = participantList.find(p => (p as any).screenShareOn || (p as any).screenShareStream);
-            if (screenOwner) {
-              // Prefer SDK-provided screenShareStream; convert to MediaStream if necessary
-              const s = (screenOwner as any).screenShareStream;
-              let screenMedia: MediaStream | null = null;
-              if (s && s.track) {
-                try { screenMedia = new MediaStream([s.track]); } catch (e) { screenMedia = null; }
-              }
-
+            const presenterId = (meetingApi as any)?.presenterId || null;
+            if (presenterId) {
               return (
                 <div className="flex-1 flex flex-col gap-4 min-h-0">
                   <div className="flex-1 min-h-0">
-                    <SharedScreenView
-                      screenStream={screenMedia}
-                      isControlActive={remoteControl.state.controlAllowed}
-                      meetingId={roomId}
-                      customerId={customerUserId || ''}
-                      controllerId={remoteControl.state.controllerId || ''}
-                      onSendEvent={(e) => remoteControl.sendControlEvent(e as any)}
-                    />
+                    <PresenterScreenView presenterId={presenterId} />
                   </div>
 
                   {/* Smaller participant thumbnails below the shared screen */}
@@ -631,7 +540,8 @@ const MeetingRoom: React.FC<{
 
             <div className="flex items-center gap-2">
                 {(() => {
-                  const customerScreenShareActive = customerParticipantId ? ((participants.get(customerParticipantId) as any)?.screenShareOn || false) : false;
+                  const presenterId = (meetingApi as any)?.presenterId || null;
+                  const customerScreenShareActive = presenterId !== null && presenterId === customerParticipantId;
                   return (
                     <RequestControlButton
                       isScreenSharing={customerScreenShareActive}
