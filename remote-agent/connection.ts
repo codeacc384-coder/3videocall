@@ -15,10 +15,13 @@ export class AgentConnection {
   private connectionHandlers: ((connected: boolean) => void)[] = [];
 
   constructor(url?: string) {
-    // Use environment variable for relay server URL
-    // Development: ws://localhost:8080/remote-control
-    // Production: wss://remote.example.com/remote-control
+    // Use environment variable for relay server URL.
+    // Production: set REMOTE_CONTROL_WS_URL=wss://threevideocall.onrender.com/remote-control
+    // Development fallback: ws://localhost:8080/remote-control
     this.url = url || process.env.REMOTE_CONTROL_WS_URL || 'ws://localhost:8080/remote-control';
+    if (!process.env.REMOTE_CONTROL_WS_URL) {
+      console.warn('[AgentConnection] REMOTE_CONTROL_WS_URL not set, using localhost fallback');
+    }
     console.log('[AgentConnection] Using relay server:', this.url);
   }
 

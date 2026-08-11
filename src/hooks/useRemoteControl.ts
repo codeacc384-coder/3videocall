@@ -32,9 +32,14 @@ export function useRemoteControl(
 
   // Initialize socket connection
   useEffect(() => {
-    socketRef.current = new RemoteControlSocket();
+    try {
+      socketRef.current = new RemoteControlSocket();
+    } catch (err) {
+      console.warn('[RemoteControl] Relay not configured, remote-control disabled:', (err as Error).message);
+      return;
+    }
     socketRef.current.connect().catch(() => {
-      console.log('[RemoteControl] Agent not available');
+      console.log('[RemoteControl] Could not connect to relay');
     });
 
     return () => {
