@@ -1,6 +1,6 @@
 import WebSocket from 'ws';
 
-export type ControllerRole = 'officer' | 'adviser';
+export type ControllerRole = 'officer' | 'advisor';
 
 export interface ActiveRemoteSession {
   remoteSessionId: string;

@@ -5,7 +5,7 @@ export interface TokenPayload {
   meetingId: string;
   userId: string;
   role: 'agent' | 'controller';
-  controllerRole?: 'officer' | 'adviser';
+  controllerRole?: 'officer' | 'advisor';
   iat: number;
   exp: number;
 }
@@ -26,7 +26,7 @@ export class AuthenticationService {
     meetingId: string,
     userId: string,
     role: 'agent' | 'controller',
-    controllerRole?: 'officer' | 'adviser'
+    controllerRole?: 'officer' | 'advisor'
   ): string {
     const payload: TokenPayload = {
       remoteSessionId,
@@ -116,7 +116,7 @@ export class AuthenticationService {
     token: string,
     remoteSessionId: string,
     controllerId: string,
-    controllerRole: 'officer' | 'adviser'
+    controllerRole: 'officer' | 'advisor'
   ): boolean {
     const payload = this.verifyToken(token);
     if (!payload) return false;

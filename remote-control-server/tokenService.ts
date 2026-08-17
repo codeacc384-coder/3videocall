@@ -11,7 +11,7 @@ export interface TokenPayload {
   meetingId: string;
   userId: string;
   role: 'agent' | 'controller';
-  controllerRole?: 'officer' | 'adviser';
+  controllerRole?: 'officer' | 'advisor';
   iat: number;
   exp: number;
 }
@@ -49,7 +49,7 @@ export class RemoteControlTokenService {
     remoteSessionId: string,
     meetingId: string,
     controllerId: string,
-    controllerRole: 'officer' | 'adviser'
+    controllerRole: 'officer' | 'advisor'
   ): string {
     const payload: TokenPayload = {
       remoteSessionId,

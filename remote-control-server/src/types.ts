@@ -9,7 +9,7 @@ import WebSocket from 'ws';
  * - officer
  * - advisor
  *
- * Do NOT use "adviser" anywhere in the relay protocol.
+ * Do NOT use "advisor" anywhere in the relay protocol.
  */
 export type ControllerRole = 'officer' | 'advisor';
 

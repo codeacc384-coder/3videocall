@@ -651,6 +651,9 @@ export class MessageRouter {
      * etc.
      */
     try {
+      console.log(
+        `[MessageRouter] Forwarding ${event.type} to agent for session ${remoteSessionId}`
+      );
       agentSocket.send(
         JSON.stringify(event)
       );
